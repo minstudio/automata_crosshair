@@ -1,0 +1,13 @@
+numpy
+scipy
+scikit-learn
+scikit-image
+hdbscan
+matplotlib
+pillow
+opencv-python
+trimesh
+pyrender
+torch
+torchvision
+transformers
