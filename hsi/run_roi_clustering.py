@@ -1,7 +1,7 @@
 """
 Run HDBSCAN clustering on artifacts with verified ROI masks.
 
-Uses the clustering algorithm from hsi_experimental/auto_segment_cluster_single.py
+Uses the clustering algorithm from hsi/auto_segment_cluster_single.py
 with the client-provided masks from hsi/output/roi/ instead of auto-segmented ones.
 
 Usage:
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from paths import DATASET_ROOT
 from hsi.process_all_hdbscan_pca_single import read_hsi_cube
 from hsi.hsi_3d_registration import parse_datacube_angle
-from hsi_experimental.auto_segment_cluster_single import (
+from hsi.auto_segment_cluster_single import (
     run_hdbscan_clustering, run_clustering, run_superpixel_clustering,
     find_capture_path, find_hsi_files,
 )

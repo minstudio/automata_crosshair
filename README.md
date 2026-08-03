@@ -112,7 +112,7 @@ Open the PLYs in MeshLab / CloudCompare to inspect the targets.
 - `hsi/segment_roi_birefnet.py`: manual ROI + BiRefNet viewfinder segmentation (step 1).
 - `hsi/run_roi_clustering.py`: ROI-masked HSI clustering (step 2).
 - `hsi/process_all_hdbscan_pca_single.py`: HSI cube reading + HDBSCAN/PCA clustering internals.
-- `hsi_experimental/auto_segment_cluster_single.py`: clustering algorithms shared by step 2.
+- `hsi/auto_segment_cluster_single.py`: clustering algorithms shared by step 2.
 - `hsi/hsi_3d_registration.py`: silhouette-based HSI-to-3D registration + flatness scoring.
 - `hsi/test_pca_viewpoints.py`: PCA-driven viewpoint selection used during registration.
 - `photogrammetry/analyze_hsi_clusters_remote.py`: crosshair generation entry point (step 3).
