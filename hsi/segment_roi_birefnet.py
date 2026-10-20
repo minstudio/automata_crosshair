@@ -330,6 +330,9 @@ def main():
                     help="Batch over all artifact folders that have HSI data")
     ap.add_argument("--output_dir", default="hsi/output",
                     help="Output directory (batch mode, default: hsi/output)")
+    ap.add_argument("--artifacts", nargs="+", default=None,
+                    help="In batch mode, only process these artifact folders "
+                         "(e.g. --artifacts lot1n1 lot2n15)")
     ap.add_argument("--overwrite", action="store_true",
                     help="In batch mode, re-process artifacts that already have a mask "
                          "(default: skip them)")
@@ -363,6 +366,12 @@ def main():
             )
         )
         criteria = "HSI data" if args.hsi_only else "all 4 data types"
+        if args.artifacts:
+            wanted = set(args.artifacts)
+            missing = wanted - {f.name for f in folders}
+            folders = [f for f in folders if f.name in wanted]
+            if missing:
+                print(f"WARNING: not found or missing {criteria}: {', '.join(sorted(missing))}")
         print(f"Found {len(folders)} folders with {criteria}")
 
         out_dir = Path(args.output_dir)

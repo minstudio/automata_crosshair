@@ -66,6 +66,8 @@ Always run batch mode with `--hsi_only`. Without it the script also requires leg
 python hsi/segment_roi_birefnet.py --batch --hsi_only --output_dir hsi/output/roi
 ```
 
+Add `--artifacts lot1n1 lot2n15` to segment only specific artifacts.
+
 Controls per image: left-drag to draw/redraw the ROI box, `Enter`/`R` to run BiRefNet on the current box, `S` to save the mask and move to the next image, `D` to skip without saving, `Q` to quit. Already-masked artifacts are skipped unless `--overwrite` is passed.
 
 Single image mode:
