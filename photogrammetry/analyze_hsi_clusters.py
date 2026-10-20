@@ -2,14 +2,20 @@
 analyze_hsi_clusters.py
 
 For each HSI spectral cluster, map the 2D cluster region to the 3D mesh via
-silhouette-based registration, then find the top 3 flattest non-overlapping
-measurement positions (crosshairs) within that cluster's 3D region.
+silhouette-based registration, then place XRF and Raman targets (crosshairs).
+
+- XRF: BFS flat-region candidates, ranked by flatness + graded rim penalty.
+- Raman: XRF points near a cluster are reused as its Raman targets; the rest
+  are placed per blob at the pixel minimising normalised flatness
+  + 2 * rim penalty + 1 * other-cluster penalty.
 
 Clusters too small for at least --min-crosshairs placements are skipped.
 
 Usage:
-    python photogrammetry/analyze_hsi_clusters.py
     python photogrammetry/analyze_hsi_clusters.py --artifact lot1n1
+    python photogrammetry/analyze_hsi_clusters.py --all
+    python photogrammetry/analyze_hsi_clusters.py --artifact lot1n2 --rim-dist 1.5 --cluster-gap-px 24
+    python photogrammetry/analyze_hsi_clusters.py --artifact lot1n2 --no-rim
 """
 
 import argparse
@@ -23,7 +29,7 @@ import numpy as np
 import scipy.sparse as sp
 import trimesh
 from PIL import Image
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, cKDTree
 
 warnings.filterwarnings("ignore")
 
@@ -374,41 +380,21 @@ def mask_to_face_indices(mask_cube, best_M, face_buf, grid=256):
 # ── XRF square search ─────────────────────────────────────────────────────────
 
 def find_xrf_squares(vertices, cand_idx, N, H_local, concave=None,
-                     n_points=3, excluded=None, concave_penalty=50.0, 
-                     min_edge_distance_factor=2.5):
+                     n_points=3, excluded=None, concave_penalty=50.0,
+                     rim_tree=None, min_rim_dist=1.0):
     """
     Top n_points non-overlapping flat squares within cand_idx.
     Concavity penalty (convex-hull depth) strongly discourages concave surfaces.
     Falls back through smaller scales if needed.
-    
-    min_edge_distance_factor: Minimum distance from region edge as multiple 
-                              of crosshair half_size (e.g., 2.5 = 2.5 crosshair widths)
-    
     Returns list of dicts: point, idx, h, half_size, label.
     """
     search = cand_idx
     if len(search) > 1500:
         search = search[:: len(search) // 1500]
-    
-    # Compute boundary vertices (vertices on edge of candidate region)
-    # Find vertices that have neighbors outside the candidate region
-    from scipy.spatial.distance import cdist
-    all_vertices = np.arange(len(vertices))
-    boundary_vertices = []
-    
-    # For efficiency, use spatial distance to find boundary
-    if len(cand_idx) > 0:
-        cand_set = set(cand_idx)
-        for vi in cand_idx:
-            # Find nearby vertices within a small radius
-            distances = np.sqrt(np.sum((vertices - vertices[vi])**2, axis=1))
-            nearby_idx = np.where(distances < 0.5)[0]  # Within 0.5cm
-            
-            # If any nearby vertices are outside candidate region, this is boundary
-            if any(idx not in cand_set for idx in nearby_idx):
-                boundary_vertices.append(vi)
-        
-        boundary_vertices = np.array(boundary_vertices)
+
+    rim_d_arr = None
+    if rim_tree is not None and len(search):
+        rim_d_arr, _ = rim_tree.query(vertices[search])
 
     scales = [1.0, 0.8, 0.6, 0.4, 0.2, 0.1, 0.05, 0.025]
     best = []
@@ -418,17 +404,8 @@ def find_xrf_squares(vertices, cand_idx, N, H_local, concave=None,
         gap   = 3.0 * scale
         cands = []
 
-        for vi in search:
+        for si, vi in enumerate(search):
             pt = vertices[vi]
-            
-            # Check distance from region boundary
-            min_distance_required = half * min_edge_distance_factor
-            if len(boundary_vertices) > 0:
-                boundary_distances = np.sqrt(np.sum((vertices[boundary_vertices] - pt)**2, axis=1))
-                min_boundary_distance = boundary_distances.min()
-                if min_boundary_distance < min_distance_required:
-                    continue  # Too close to edge
-            
             nearby = np.where(np.sum((vertices - pt) ** 2, axis=1) < (half * 1.5) ** 2)[0]
             if not len(nearby):
                 continue
@@ -450,9 +427,20 @@ def find_xrf_squares(vertices, cand_idx, N, H_local, concave=None,
 
             cv_penalty = concave[vi] * concave_penalty if concave is not None else 0.0
             score = H_local[sq].mean() + (1.0 - dots.mean()) * 100.0 + cv_penalty
-            cands.append({"idx": vi, "point": pt.copy(), "h": score})
+            rim_d = float(rim_d_arr[si]) if rim_d_arr is not None else np.inf
+            cands.append({"idx": vi, "point": pt.copy(), "h": score, "rim_d": rim_d})
 
-        cands.sort(key=lambda x: x["h"])
+        if not cands:
+            continue
+
+        hs = np.array([c["h"] for c in cands])
+        h_lo, h_rng = hs.min(), max(float(np.ptp(hs)), 1e-9)
+        for c in cands:
+            rim_def = max(0.0, 1.0 - c["rim_d"] / min_rim_dist) if np.isfinite(c["rim_d"]) else 0.0
+            c["rim_def"] = rim_def
+            c["score"] = (c["h"] - h_lo) / h_rng + 2.0 * rim_def
+
+        cands.sort(key=lambda x: x["score"])
         labels = ["Rank 1 (Best)", "Rank 2", "Rank 3"]
         sel = []
         for c in cands:
@@ -571,10 +559,88 @@ def _blob_centroid_to_3d(cx, cy, blob_yx, M_inv, face_buf, mesh_cm, vertices, gr
     return None
 
 
+def _blob_pixels_to_faces(blob_yx, M_inv, face_buf, grid):
+    """Vectorised cube-space pixel -> mesh face lookup for one blob."""
+    sy, sx = blob_yx[:, 0].astype(float), blob_yx[:, 1].astype(float)
+    pts = np.stack([sx, sy, np.ones_like(sx)], axis=1)
+    rend = (M_inv @ pts.T).T
+    rx = rend[:, 0] / rend[:, 2]
+    ry = rend[:, 1] / rend[:, 2]
+    gi = np.clip((ry / IMG_H * grid).astype(int), 0, grid - 1)
+    gj = np.clip((rx / IMG_W * grid).astype(int), 0, grid - 1)
+    return face_buf[gi, gj]
+
+
+def _flattest_pixel_in_blob(blob_yx, M_inv, face_buf, grid, face_flatness, valid_arr):
+    """Pixel of the blob whose mesh face is flattest. None if none map to the mesh."""
+    fi = _blob_pixels_to_faces(blob_yx, M_inv, face_buf, grid)
+    ok = fi >= 0
+    if valid_arr is not None:
+        ok &= valid_arr[np.clip(fi, 0, len(valid_arr) - 1)]
+    if not ok.any():
+        return None
+    scores = np.where(ok, face_flatness[np.clip(fi, 0, len(face_flatness) - 1)], -np.inf)
+    best = int(np.argmax(scores))
+    return float(blob_yx[best, 0]), float(blob_yx[best, 1]), float(scores[best])
+
+
+def _best_pixel_in_blob(blob_yx, cy, cx, M_inv, face_buf, grid, mesh_cm,
+                        face_flatness, valid_arr, rim_tree, min_rim_dist,
+                        d_other, min_other_dist_px):
+    """Pixel of the blob minimising normalised flatness (or centroid distance when
+    face_flatness is None) + 2 * rim penalty + 1 * other-cluster penalty.
+    Returns (py, px, flat_score, rim_d, oth_def) or None if nothing maps to the mesh."""
+    fi = _blob_pixels_to_faces(blob_yx, M_inv, face_buf, grid)
+    ok = fi >= 0
+    if valid_arr is not None:
+        ok &= valid_arr[np.clip(fi, 0, len(valid_arr) - 1)]
+    if not ok.any():
+        return None
+    fic = np.clip(fi, 0, len(mesh_cm.faces) - 1)
+    ys = blob_yx[:, 0].astype(float)
+    xs = blob_yx[:, 1].astype(float)
+
+    if face_flatness is not None:
+        base = -face_flatness[fic]
+    else:
+        base = np.hypot(ys - cy, xs - cx)
+    b_ok = base[ok]
+    base_n = (base - b_ok.min()) / max(float(np.ptp(b_ok)), 1e-9)
+
+    rim_d = np.full(len(fi), np.inf)
+    rim_def = np.zeros(len(fi))
+    if rim_tree is not None:
+        uf, inv = np.unique(fic[ok], return_inverse=True)
+        centers = mesh_cm.vertices[mesh_cm.faces[uf]].mean(axis=1)
+        d, _ = rim_tree.query(centers)
+        rim_d[ok] = d[inv]
+        rim_def[ok] = np.clip(1.0 - rim_d[ok] / min_rim_dist, 0.0, None)
+
+    oth_def = np.zeros(len(fi))
+    if d_other is not None:
+        yi = np.clip(blob_yx[:, 0].astype(int), 0, d_other.shape[0] - 1)
+        xi = np.clip(blob_yx[:, 1].astype(int), 0, d_other.shape[1] - 1)
+        oth_def = np.clip(1.0 - d_other[yi, xi] / min_other_dist_px, 0.0, None)
+
+    score = np.where(ok, base_n + 2.0 * rim_def + 1.0 * oth_def, np.inf)
+    b = int(np.argmin(score))
+    flat_score = float(face_flatness[fic[b]]) if face_flatness is not None else None
+    return float(ys[b]), float(xs[b]), flat_score, float(rim_d[b]), float(oth_def[b])
+
+
 def find_raman_targets(vertices, N, mask_cube, best_M, face_buf, mesh_cm,
-                       n_points=3, min_points=2, grid=256, valid_fi=None):
+                       n_points=3, min_points=2, grid=256, valid_fi=None,
+                       flatness=None, rim_tree=None, min_rim_dist=1.0,
+                       other_mask=None, min_other_dist_px=16):
     """
     Find Raman targets from the n_points largest 2D blobs in the cluster mask.
+
+    When `flatness` (per-vertex flatness, as produced by compute_flatness_scores)
+    is given, the target inside each blob is the FLATTEST point rather than the
+    blob centroid, so the same position is usable by XRF as well. This restores
+    step 5 of hsi/hsi_3d_registration.py ("select the flattest point per HSI
+    spectral cluster"), which was lost when target selection moved into this
+    script. Pass flatness=None for the old centroid behaviour.
     Large single blobs are spatially subdivided so that n_points targets can be
     placed even in a fully contiguous region.
     Maps each blob centroid from cube space → render space → mesh face → 3D point.
@@ -586,6 +652,12 @@ def find_raman_targets(vertices, N, mask_cube, best_M, face_buf, mesh_cm,
     rank_labels = ["Rank 1 (Biggest)", "Rank 2", "Rank 3"]
     half = 0.35
     M_inv = np.linalg.inv(best_M)
+
+    d_other = None
+    if other_mask is not None and other_mask.any():
+        om = cv2.morphologyEx(other_mask.astype(np.uint8), cv2.MORPH_CLOSE,
+                              np.ones((7, 7), np.uint8))
+        d_other = cv2.distanceTransform((om == 0).astype(np.uint8), cv2.DIST_L2, 3)
 
     # Collect candidate centroids from blobs; subdivide largest blob if needed
     candidates = []  # list of (cy, cx, n_px)
@@ -615,9 +687,28 @@ def find_raman_targets(vertices, N, mask_cube, best_M, face_buf, mesh_cm,
         # Replace the first candidate with sub-regions
         candidates = sub_candidates + candidates[1:]
 
+    face_flatness = None
+    valid_arr = None
+    if flatness is not None:
+        face_flatness = flatness[mesh_cm.faces].mean(axis=1)
+    if valid_fi is not None:
+        valid_arr = np.zeros(len(mesh_cm.faces), dtype=bool)
+        keep = np.fromiter(valid_fi, dtype=np.int64)
+        keep = keep[(keep >= 0) & (keep < len(valid_arr))]
+        valid_arr[keep] = True
+
     targets = []
     for i, (cy, cx, n_px, blob_yx) in enumerate(candidates[:n_points]):
-        result = _blob_centroid_to_3d(cx, cy, blob_yx, M_inv, face_buf, mesh_cm, vertices, grid,
+        flat_score = None
+        rim_d, oth_def = None, None
+        py, px = cy, cx
+        best = _best_pixel_in_blob(blob_yx, cy, cx, M_inv, face_buf, grid, mesh_cm,
+                                   face_flatness, valid_arr, rim_tree, min_rim_dist,
+                                   d_other, min_other_dist_px)
+        if best is not None:
+            py, px, flat_score, rim_d, oth_def = best
+
+        result = _blob_centroid_to_3d(px, py, blob_yx, M_inv, face_buf, mesh_cm, vertices, grid,
                                       valid_fi=valid_fi)
         if result is None:
             continue
@@ -626,6 +717,11 @@ def find_raman_targets(vertices, N, mask_cube, best_M, face_buf, mesh_cm,
             "idx": face_vi,
             "point": vertices[face_vi].copy(),
             "n_px": n_px,
+            "pixel": [int(round(px)), int(round(py))],
+            "flatness_score": flat_score,
+            "from_flatness": flat_score is not None,
+            "rim_d": rim_d if rim_d is not None and np.isfinite(rim_d) else None,
+            "oth_def": oth_def,
             "label": rank_labels[i] if i < len(rank_labels) else f"Rank {i+1}",
             "half_size": half,
         })
@@ -675,19 +771,77 @@ def main():
     ap.add_argument("--clusters-dir",  default=None,
                     help="Directory with *_clusters.png")
     ap.add_argument("--output",        default=None)
-    ap.add_argument("--grid-size",     type=int, default=128,
-                    help="Ray-grid resolution for face buffer (lower=faster)")
+    ap.add_argument("--grid-size",     type=int, default=256,
+                    help="Ray-grid resolution for face buffer")
     ap.add_argument("--min-crosshairs", type=int, default=2,
                     help="Skip cluster if fewer crosshairs fit")
     ap.add_argument("--xrf-only", action="store_true",
                     help="Skip Raman step (faster iteration on XRF only)")
-    ap.add_argument("--low-memory", action="store_true",
-                    help="Use low-memory settings (faster, lower quality)")
-    ap.add_argument("--edge-distance", type=float, default=2.5,
-                    help="Minimum distance from region edge as multiple of crosshair size (default: 2.5)")
+    ap.add_argument("--raman-centroid", action="store_true",
+                    help="Place Raman targets at the blob centroid instead of the "
+                         "flattest point in the blob (pre-fix behaviour)")
+    ap.add_argument("--no-xrf-share", action="store_true",
+                    help="Do not reuse XRF points as Raman targets")
+    ap.add_argument("--xrf-share-cm", type=float, default=0.5,
+                    help="An XRF point within this distance of a cluster region is "
+                         "reused as one of its Raman targets (default: 0.5 cm)")
+    ap.add_argument("--rim-dist", type=float, default=1.0,
+                    help="Preferred min distance (cm) from steep edges/rim (soft constraint)")
+    ap.add_argument("--rim-angle", type=float, default=55.0,
+                    help="Surface tilt (deg, vs viewing direction) above which "
+                         "an area counts as steep edge/rim")
+    ap.add_argument("--cluster-gap-px", type=int, default=16,
+                    help="Preferred min distance (cube px) between a Raman target "
+                         "and other clusters (soft constraint)")
+    ap.add_argument("--no-rim", action="store_true",
+                    help="Disable rim avoidance (cluster-gap penalty still applies)")
+    ap.add_argument("--all", action="store_true",
+                    help="Process every artifact that has a cluster map and a 3D OBJ "
+                         "(ignores --artifact)")
     args = ap.parse_args()
 
-    art = args.artifact
+    if args.all:
+        run_all(args)
+    else:
+        process_artifact(args.artifact, args)
+
+
+def run_all(args):
+    """Process all artifacts that have both a *_clusters.png and a 3D OBJ."""
+    script_dir = Path(__file__).resolve().parent.parent
+    clusters_dir = Path(args.clusters_dir) if args.clusters_dir \
+        else script_dir / "hsi" / "output" / "roi_clustered"
+    suffix = "_clusters.png"
+    arts = sorted(p.name[:-len(suffix)] for p in clusters_dir.glob(f"*{suffix}"))
+    if not arts:
+        print(f"ERROR: no *{suffix} found in {clusters_dir}"); sys.exit(1)
+
+    print(f"Found {len(arts)} artifacts with cluster maps in {clusters_dir}\n")
+    ok, skipped, failed = [], [], []
+    for i, art in enumerate(arts, 1):
+        print("\n" + "=" * 70)
+        print(f"[{i}/{len(arts)}] Processing {art}")
+        print("=" * 70)
+        try:
+            done = process_artifact(art, args)
+            (ok if done else skipped).append(art)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            failed.append(art)
+            print(f"  !! FAILED {art}: {e}")
+
+    print("\n" + "=" * 70)
+    print(f"All done: {len(ok)} ok, {len(skipped)} skipped, {len(failed)} failed.")
+    if skipped:
+        print(f"  skipped (missing data): {', '.join(skipped)}")
+    if failed:
+        print(f"  failed (error):         {', '.join(failed)}")
+
+
+def process_artifact(art, args):
+    """Run the full crosshair pipeline for one artifact.
+    Returns True on success, False if required inputs are missing (skip)."""
     root = Path(DATASET_ROOT)
     art_dir = root / art
     script_dir = Path(__file__).resolve().parent.parent
@@ -703,13 +857,13 @@ def main():
     roi_mask_png = roi_dir      / f"{art}_mask.png"
 
     if not clusters_png.exists():
-        print(f"ERROR: {clusters_png} not found"); sys.exit(1)
+        print(f"  SKIP: {clusters_png} not found"); return False
 
     # ── Mesh ──────────────────────────────────────────────────────────────────
     photo_raw = art_dir / "photogrammetry" / "raw_data"
     obj_files = sorted(photo_raw.glob("*.obj"))
     if not obj_files:
-        print(f"ERROR: no .obj under {photo_raw}"); sys.exit(1)
+        print(f"  SKIP: no .obj under {photo_raw}"); return False
     mesh_path = obj_files[0]
     print(f"\n[mesh] {mesh_path.name}")
 
@@ -749,61 +903,6 @@ def main():
     else:
         mesh = raw
     print(f"    {len(mesh.vertices)} verts  {len(mesh.faces)} faces")
-    
-    # Simplify mesh if too large (reduce memory usage)
-    max_faces = 50000 if args.low_memory else 200000  # Lower limit for low-memory mode
-    if len(mesh.faces) > max_faces:
-        print(f"    Mesh too large ({len(mesh.faces)} faces), simplifying to {max_faces} faces...")
-        original_faces = len(mesh.faces)
-        # Use progressive mesh simplification that preserves topology
-        try:
-            # Try to install and use pymeshlab for better decimation
-            import pymeshlab as ml
-            ms = ml.MeshSet()
-            ms.add_mesh(ml.Mesh(vertex_matrix=mesh.vertices, face_matrix=mesh.faces))
-            
-            # Calculate target number of faces
-            target_faces = max_faces
-            ms.apply_filter('meshing_decimation_quadric_edge_collapse', targetfacenum=target_faces)
-            
-            # Get simplified mesh
-            simplified = ms.current_mesh()
-            mesh = trimesh.Trimesh(vertices=simplified.vertex_matrix(), faces=simplified.face_matrix())
-            print(f"    Used pymeshlab quadric edge collapse")
-            
-        except ImportError:
-            # Fallback: use trimesh built-in simplification
-            try:
-                # Try basic trimesh simplification
-                mesh = mesh.smoothed()  # Smooth first to help with decimation
-                
-                # Remove duplicate vertices and degenerate faces
-                mesh.remove_duplicate_faces()
-                mesh.remove_degenerate_faces()
-                mesh.remove_unreferenced_vertices()
-                
-                # If still too large, subsample faces more carefully
-                if len(mesh.faces) > max_faces:
-                    # Keep every Nth face to maintain some structure
-                    step = len(mesh.faces) // max_faces
-                    if step > 1:
-                        keep_faces = np.arange(0, len(mesh.faces), step)[:max_faces]
-                        mesh.update_faces(keep_faces)
-                        # Clean up the mesh after face removal
-                        mesh.remove_unreferenced_vertices()
-                        
-                print(f"    Used basic trimesh simplification")
-                
-            except Exception as e:
-                print(f"    Simplification failed: {e}. Proceeding with original mesh.")
-                # If all else fails, just warn and continue with original mesh
-                print(f"    WARNING: Using full mesh - may require more memory")
-        print(f"    Simplified: {original_faces} -> {len(mesh.faces)} faces ({len(mesh.vertices)} verts)")
-    
-    # Adjust grid size for low-memory mode
-    if args.low_memory and args.grid_size > 64:
-        args.grid_size = 64
-        print(f"    Low-memory mode: reducing grid size to {args.grid_size}")
 
     # Normalised copy for registration / ray-casting
     mesh_norm = mesh.copy()
@@ -839,6 +938,27 @@ def main():
     cam_pose = look_at_pose(best_eye)
     print(f"    IoU={best_iou:.3f}  eye={best_eye.round(3)}")
 
+    rim_tree = None
+    if not args.no_rim:
+        view_dir = best_eye / (np.linalg.norm(best_eye) + 1e-20)
+        F = mesh_cm.faces
+        n_v = len(mesh_cm.vertices)
+        I = np.hstack([F[:, 0], F[:, 1], F[:, 1], F[:, 2], F[:, 2], F[:, 0]])
+        J = np.hstack([F[:, 1], F[:, 0], F[:, 2], F[:, 1], F[:, 0], F[:, 2]])
+        A = sp.coo_matrix((np.ones(len(I)), (I, J)), shape=(n_v, n_v)).tocsr()
+        deg = np.asarray(A.sum(axis=1)).ravel() + 1.0
+        Ns = N_arr.copy()
+        for _ in range(5):
+            Ns = (Ns + A @ Ns) / deg[:, None]
+        Ns /= np.linalg.norm(Ns, axis=1, keepdims=True) + 1e-20
+        dots = Ns @ view_dir
+        steep_mask = (dots < np.cos(np.radians(args.rim_angle))) & (dots > -0.5)
+        rim_tree = cKDTree(mesh_cm.vertices[steep_mask]) if steep_mask.any() else None
+        print(f"    Steep-edge vertices: {int(steep_mask.sum())} "
+              f"(tilt > {args.rim_angle:.0f} deg from view, rim-dist {args.rim_dist} cm)")
+    else:
+        print("    Rim avoidance disabled (--no-rim)")
+
     # ── Face buffer ────────────────────────────────────────────────────────────
     print(f"\n[4] Face index buffer ({args.grid_size}²)...")
     face_buf = build_face_buffer(mesh_norm, cam_pose, grid=args.grid_size)
@@ -869,10 +989,12 @@ def main():
     print(f"  Searching {len(xrf_cand)} candidate vertices for XRF squares...")
     xrf_results = find_xrf_squares(V_cm, xrf_cand, N_arr, H_local,
                                    concave=concave, n_points=3, concave_penalty=50.0,
-                                   min_edge_distance_factor=args.edge_distance)
+                                   rim_tree=rim_tree, min_rim_dist=args.rim_dist)
     for x in xrf_results:
+        rd = x.get("rim_d", np.inf)
         print(f"    {x['label']}  pt={x['point'].round(3)}"
-              f"  half={x['half_size']:.3f}  h={x['h']:.4f}")
+              f"  half={x['half_size']:.3f}  h={x['h']:.4f}"
+              f"  rim_d={'inf' if not np.isfinite(rd) else f'{rd:.2f}'}")
 
     # ── Raman: per-cluster connected-component targets ─────────────────────────
     if args.xrf_only:
@@ -880,21 +1002,103 @@ def main():
         raman_data = []
     else:
         print("\n[6/raman] Per-cluster Raman targets...")
+
+        # Project every cluster once, then hand each XRF point to the SINGLE
+        # nearest cluster region. Reusing the XRF spot as that cluster's Raman
+        # target means one physical measurement serves both instruments; the
+        # exclusivity stops two clusters claiming the same spot.
+        cluster_faces = {}
+        for ci, (color, mask_cube) in enumerate(cluster_list):
+            fi = mask_to_face_indices(mask_cube, best_M, face_buf, grid=args.grid_size)
+            if len(fi):
+                cluster_faces[ci] = (fi, np.unique(mesh_cm.faces[fi].ravel()))
+
+        xrf_assign = {ci: [] for ci in cluster_faces}
+        if not args.no_xrf_share:
+            for xr, x in enumerate(xrf_results):
+                best_ci, best_d = None, np.inf
+                for ci, (_fi, vi_c) in cluster_faces.items():
+                    d = float(np.linalg.norm(V_cm[vi_c] - x["point"], axis=1).min())
+                    if d < best_d:
+                        best_ci, best_d = ci, d
+                if best_ci is not None and best_d <= args.xrf_share_cm:
+                    xrf_assign[best_ci].append((xr, x))
+                    print(f"    XRF rank {xr + 1} -> cluster {best_ci} "
+                          f"({best_d:.3f} cm), reused as a Raman target")
+                else:
+                    print(f"    XRF rank {xr + 1} -> no cluster within "
+                          f"{args.xrf_share_cm} cm (nearest {best_d:.3f} cm)")
+
         raman_data = []
         for ci, (color, mask_cube) in enumerate(cluster_list):
             print(f"\n  Cluster {ci}  color={color}  pixels={mask_cube.sum()}")
-            fi = mask_to_face_indices(mask_cube, best_M, face_buf, grid=args.grid_size)
-            if not len(fi):
+            if ci not in cluster_faces:
                 print("    SKIP — no mesh faces found")
                 raman_data.append({"ci": ci, "color": color, "mask": mask_cube,
                                    "skipped": True, "reason": "no 3d faces", "targets": []})
                 continue
 
-            vi = np.unique(mesh_cm.faces[fi].ravel())
+            fi, vi = cluster_faces[ci]
             fi_set = set(fi.tolist())   # cluster's painted face set
-            targets = find_raman_targets(V_cm, N_arr, mask_cube, best_M, face_buf, mesh_cm,
-                                         n_points=3, min_points=args.min_crosshairs,
-                                         grid=args.grid_size, valid_fi=fi_set)
+            shared = xrf_assign.get(ci, [])
+
+            shared_px = {}
+            if shared:
+                mask_yx = np.column_stack(np.where(mask_cube))
+                fi_px = _blob_pixels_to_faces(mask_yx, np.linalg.inv(best_M),
+                                              face_buf, args.grid_size)
+                ok_px = fi_px >= 0
+                fcen = mesh_cm.vertices[mesh_cm.faces].mean(axis=1)
+                for xr, x in shared:
+                    d = np.full(len(mask_yx), np.inf)
+                    if ok_px.any():
+                        d[ok_px] = np.linalg.norm(fcen[fi_px[ok_px]] - x["point"], axis=1)
+                    b = int(np.argmin(d))
+                    if np.isfinite(d[b]):
+                        shared_px[xr] = [int(mask_yx[b, 1]), int(mask_yx[b, 0])]
+
+            targets = []
+            for xr, x in shared[:3]:
+                targets.append({
+                    "idx": int(x["idx"]),
+                    "point": np.asarray(x["point"]).copy(),
+                    "n_px": None,
+                    "pixel": shared_px.get(xr),
+                    "flatness_score": None,
+                    "from_flatness": False,
+                    "from_xrf": True,
+                    "xrf_rank": xr + 1,
+                    "label": f"Rank {len(targets) + 1} (XRF shared)",
+                    "half_size": 0.35,
+                })
+
+            if len(targets) < 3:
+                other_mask = np.zeros_like(mask_cube)
+                for cj, (_c2, m2) in enumerate(cluster_list):
+                    if cj != ci:
+                        other_mask |= m2
+                blob_targets = find_raman_targets(V_cm, N_arr, mask_cube, best_M, face_buf,
+                                                  mesh_cm, n_points=3,
+                                                  min_points=1,
+                                                  grid=args.grid_size, valid_fi=fi_set,
+                                                  flatness=None if args.raman_centroid else flatness,
+                                                  rim_tree=rim_tree, min_rim_dist=args.rim_dist,
+                                                  other_mask=other_mask,
+                                                  min_other_dist_px=args.cluster_gap_px)
+                gap = 2.0 * 0.35
+                for t in blob_targets:
+                    if len(targets) >= 3:
+                        break
+                    if any(np.linalg.norm(np.asarray(t["point"]) - np.asarray(o["point"])) < gap
+                           for o in targets):
+                        continue
+                    t = dict(t)
+                    t["from_xrf"] = False
+                    t["label"] = f"Rank {len(targets) + 1}"
+                    targets.append(t)
+
+            if len(targets) < args.min_crosshairs:
+                targets = []
             if not targets:
                 print(f"    SKIP — fewer than {args.min_crosshairs} viable components")
                 raman_data.append({"ci": ci, "color": color, "mask": mask_cube,
@@ -902,9 +1106,20 @@ def main():
                                    "n_faces": int(len(fi)), "targets": []})
                 continue
 
-            print(f"    Raman targets: {len(targets)}")
+            n_shared = sum(1 for t in targets if t.get("from_xrf"))
+            print(f"    Raman targets: {len(targets)}  ({n_shared} shared with XRF)")
             for t in targets:
-                print(f"      {t['label']}  pt={t['point'].round(3)}  px={t['n_px']}")
+                if t.get("from_xrf"):
+                    extra = f"  <- XRF rank {t['xrf_rank']}"
+                else:
+                    fs = t.get("flatness_score")
+                    extra = f"  flatness={fs:.3f}" if fs is not None else "  (centroid)"
+                    if t.get("rim_d") is not None:
+                        extra += f"  rim_d={t['rim_d']:.2f}"
+                    if t.get("oth_def") is not None:
+                        extra += f"  gap_pen={t['oth_def']:.2f}"
+                print(f"      {t['label']}  pt={np.asarray(t['point']).round(3)}"
+                      f"  px={t['n_px']}{extra}")
 
             raman_data.append({"ci": ci, "color": color, "mask": mask_cube,
                                "skipped": False, "n_faces": int(len(fi)), "n_verts": int(len(vi)),
@@ -950,11 +1165,18 @@ def main():
                 if len(fi):
                     vi = np.unique(mesh_cm.faces[fi].ravel())
                     raman_colors[vi] = entry["color"]
+        SHARE_OUTLINE = [np.array([255, 0, 0], dtype=np.uint8),
+                         np.array([255, 165, 0], dtype=np.uint8),
+                         np.array([255, 255, 0], dtype=np.uint8)]
         for entry in raman_data:
             if not entry["skipped"]:
                 rc = _rank_colors(entry["color"], len(entry["targets"]))
                 for rank, (fill_c, outline_c) in enumerate(rc):
-                    draw_plus(V_cm, N_arr, entry["targets"][rank], raman_colors, fill_c, outline_c, label_num=rank + 1)
+                    t = entry["targets"][rank]
+                    if t.get("from_xrf"):
+                        # outline in the XRF rank colour: this spot is shared
+                        outline_c = SHARE_OUTLINE[min(t.get("xrf_rank", 1) - 1, 2)]
+                    draw_plus(V_cm, N_arr, t, raman_colors, fill_c, outline_c, label_num=rank + 1)
         raman_ply = out_dir / f"{art}_raman.ply"
         trimesh.Trimesh(vertices=V_cm, faces=mesh_cm.faces,
                         vertex_colors=raman_colors).export(str(raman_ply))
@@ -993,7 +1215,15 @@ def main():
                 "n_faces": entry.get("n_faces"),
                 "targets": [{"label": t.get("label", "?"),
                              "point": [round(float(v), 4) for v in t["point"]],
-                             "n_px": t.get("n_px")} for t in entry.get("targets", [])],
+                             "n_px": t.get("n_px"),
+                             "pixel": t.get("pixel"),
+                             "flatness_score": t.get("flatness_score"),
+                             "from_flatness": t.get("from_flatness", False),
+                             "from_xrf": t.get("from_xrf", False),
+                             "xrf_rank": t.get("xrf_rank"),
+                             "rim_d": t.get("rim_d"),
+                             "cluster_gap_penalty": t.get("oth_def")}
+                            for t in entry.get("targets", [])],
             }
 
         raman_report = {
@@ -1015,7 +1245,13 @@ def main():
         "targets": [{"label": x.get("label", "?"),
                      "point": [round(float(v), 4) for v in x["point"]],
                      "half_size": round(float(x["half_size"]), 4),
-                     "h": round(float(x["h"]), 6)} for x in xrf_results],
+                     "h": round(float(x["h"]), 6),
+                     "rim_d": (round(float(x["rim_d"]), 4)
+                               if np.isfinite(x.get("rim_d", np.inf)) else None)}
+                    for x in xrf_results],
+        "rim_dist_cm": None if args.no_rim else args.rim_dist,
+        "rim_angle_deg": None if args.no_rim else args.rim_angle,
+        "cluster_gap_px": args.cluster_gap_px,
     }
     xrf_rpt = out_dir / f"{art}_xrf_report.json"
     with open(xrf_rpt, "w") as f:
@@ -1024,6 +1260,7 @@ def main():
 
     print(f"\nDone.\n  XRF:   {xrf_ply}"
           + (f"\n  Raman: {raman_ply}" if not args.xrf_only else "  (Raman unchanged)"))
+    return True
 
 
 if __name__ == "__main__":

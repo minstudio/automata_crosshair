@@ -23,14 +23,15 @@ import argparse
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import gpu
+
 import cv2
 import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
-from transformers import AutoModelForImageSegmentation
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from paths import DATASET_ROOT
 
 # ── BiRefNet ──────────────────────────────────────────────────────────────────
@@ -49,12 +50,7 @@ def _load_model():
     global _model, _device
     if _model is None:
         print(f"Loading BiRefNet ({_MODEL_ID})...")
-        _device = "cuda" if torch.cuda.is_available() else "cpu"
-        _model = AutoModelForImageSegmentation.from_pretrained(
-            _MODEL_ID, trust_remote_code=True)
-        _model.to(_device)
-        _model.eval()
-        print(f"  Loaded on {_device}")
+        _model, _device = gpu.load_birefnet(_MODEL_ID)
     return _model, _device
 
 
@@ -64,12 +60,9 @@ def run_birefnet_on_crop(bgr_crop):
     rgb   = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB)
     pil   = Image.fromarray(rgb)
     model, device = _load_model()
-    tensor = _TRANSFORM(pil).unsqueeze(0).to(device)
+    tensor = _TRANSFORM(pil).unsqueeze(0)
+    preds = gpu.birefnet_forward(model, tensor)
     with torch.no_grad():
-        preds = model(tensor)
-        if isinstance(preds, (list, tuple)):
-            preds = preds[-1]
-        preds = torch.sigmoid(preds)
         preds = torch.nn.functional.interpolate(
             preds, size=(h, w), mode="bilinear", align_corners=False)
     return preds.squeeze().cpu().numpy()   # float32 [0,1]

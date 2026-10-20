@@ -14,6 +14,9 @@ Notes:
 - `torch` / `torchvision` with CUDA is strongly recommended, since BiRefNet segmentation and mesh rendering are slow on CPU. Install per https://pytorch.org/get-started/locally/ for your CUDA version.
 - `pyrender` needs OpenGL. On headless Linux set `PYOPENGL_PLATFORM=egl` (the scripts attempt this automatically).
 - BiRefNet weights (`ZhengPeng7/BiRefNet`) are downloaded automatically from Hugging Face on first run.
+- `gpu.py` picks the device (CUDA, ROCm or CPU) and runs BiRefNet in fp16 on GPU. Check the setup with `python gpu.py --birefnet`. Env vars: `AUTOMATA_DEVICE=cpu|cuda` to force a device, `AUTOMATA_FP16=0` for fp32 if masks look wrong, `AUTOMATA_NO_FALLBACK=1` to crash instead of falling back to CPU.
+
+Windows shortcut: `run_crosshair_generation.bat` installs the mesh dependencies and runs step 3 for all artifacts.
 
 ## Expected dataset structure
 
@@ -85,14 +88,14 @@ Useful options: `--artifacts lot1n1 lot2n15` to process specific artifacts, `--d
 
 ### Step 3 - Crosshair generation on the 3D mesh
 
-Registers each cluster map onto the artifact's mesh (silhouette matching over PCA-selected viewpoints), scores surface flatness, and picks the best measurement points per cluster. Processes every artifact that has both a cluster map and an OBJ.
+Registers each cluster map onto the artifact's mesh (silhouette matching over PCA-selected viewpoints), scores surface flatness, and picks the best measurement points per cluster. XRF uses BFS flat-region search with a soft rim penalty; Raman reuses XRF points that fall in a cluster and fills the rest at the flattest blob pixel away from rims and other clusters. `--all` processes every artifact that has both a cluster map and an OBJ.
 
 ```bash
-python photogrammetry/analyze_hsi_clusters_remote.py --all
-python photogrammetry/analyze_hsi_clusters_remote.py --artifact lot1n1
+python photogrammetry/analyze_hsi_clusters.py --all
+python photogrammetry/analyze_hsi_clusters.py --artifact lot1n1
 ```
 
-Useful options: `--xrf-only` to skip Raman targets, `--min-crosshairs N` (clusters too small for N placements are skipped), `--rim-dist` / `--rim-angle` to keep XRF points away from rims, `--raman-gap` to control Raman point spacing, `--grid-size` for registration resolution, `--output <dir>` to redirect results.
+Useful options: `--xrf-only` to skip Raman targets, `--min-crosshairs N` (clusters with fewer viable targets are skipped), `--rim-dist` / `--rim-angle` to keep points away from rims (`--no-rim` to disable), `--cluster-gap-px` to keep Raman points away from other clusters, `--xrf-share-cm` / `--no-xrf-share` for reusing XRF points as Raman targets, `--raman-centroid` for blob-centroid Raman placement, `--grid-size` for registration resolution, `--output <dir>` to redirect results.
 
 Output per artifact in `photogrammetry/output/hsi_clusters/`:
 
@@ -104,7 +107,7 @@ Output per artifact in `photogrammetry/output/hsi_clusters/`:
 
 Open the PLYs in MeshLab / CloudCompare to inspect the targets.
 
-`photogrammetry/analyze_hsi_clusters.py` is the original local variant of the same script (kept for reference); `analyze_hsi_clusters_remote.py` is the tuned entry point to use.
+`photogrammetry/analyze_hsi_clusters_remote.py` is the previous remote version, kept for reference only.
 
 ## Module map
 
@@ -115,4 +118,6 @@ Open the PLYs in MeshLab / CloudCompare to inspect the targets.
 - `hsi/auto_segment_cluster_single.py`: clustering algorithms shared by step 2.
 - `hsi/hsi_3d_registration.py`: silhouette-based HSI-to-3D registration + flatness scoring.
 - `hsi/test_pca_viewpoints.py`: PCA-driven viewpoint selection used during registration.
-- `photogrammetry/analyze_hsi_clusters_remote.py`: crosshair generation entry point (step 3).
+- `photogrammetry/analyze_hsi_clusters.py`: crosshair generation entry point (step 3).
+- `photogrammetry/analyze_hsi_clusters_remote.py`: previous remote version (legacy).
+- `gpu.py`: device selection and BiRefNet loading/inference with CPU fallback.

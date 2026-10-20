@@ -29,6 +29,9 @@ import warnings
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import gpu
+
 import cv2
 import numpy as np
 import scipy.sparse as sp
@@ -37,7 +40,6 @@ import trimesh
 from PIL import Image
 from scipy import ndimage
 from torchvision import transforms
-from transformers import AutoModelForImageSegmentation
 
 warnings.filterwarnings("ignore")
 
@@ -195,12 +197,7 @@ def _get_birefnet():
     global _BIREFNET_MODEL, _BIREFNET_DEVICE
     if _BIREFNET_MODEL is None:
         print(f"  Loading BiRefNet ({_BIREFNET_ID})...")
-        _BIREFNET_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-        _BIREFNET_MODEL = AutoModelForImageSegmentation.from_pretrained(
-            _BIREFNET_ID, trust_remote_code=True)
-        _BIREFNET_MODEL.to(_BIREFNET_DEVICE)
-        _BIREFNET_MODEL.eval()
-        print(f"  BiRefNet loaded on {_BIREFNET_DEVICE}")
+        _BIREFNET_MODEL, _BIREFNET_DEVICE = gpu.load_birefnet(_BIREFNET_ID)
     return _BIREFNET_MODEL, _BIREFNET_DEVICE
 
 
@@ -216,13 +213,10 @@ def segment_viewfinder(viewfinder_bgr):
     pil_img = Image.fromarray(rgb)
 
     model, device = _get_birefnet()
-    input_tensor = _BIREFNET_TRANSFORM(pil_img).unsqueeze(0).to(device)
+    input_tensor = _BIREFNET_TRANSFORM(pil_img).unsqueeze(0)
+    preds = gpu.birefnet_forward(model, input_tensor)
 
     with torch.no_grad():
-        preds = model(input_tensor)
-        if isinstance(preds, (list, tuple)):
-            preds = preds[-1]
-        preds = torch.sigmoid(preds)
         preds = torch.nn.functional.interpolate(
             preds, size=(h, w), mode="bilinear", align_corners=False)
         prob = preds.squeeze().cpu().numpy()

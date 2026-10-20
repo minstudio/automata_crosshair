@@ -23,6 +23,7 @@ import trimesh
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# reuse helpers from the registration script
 from hsi_3d_registration import (
     compute_flatness_scores,
     find_best_render_by_silhouette,
@@ -33,6 +34,8 @@ from hsi_3d_registration import (
     silhouette_from_render,
 )
 
+
+# ── PCA viewpoint generation ──────────────────────────────────────────────────
 
 def pca_viewpoints(mesh_norm, radius=2.0, tilt_angles_deg=(0, 15, 30)):
     """
@@ -47,7 +50,8 @@ def pca_viewpoints(mesh_norm, radius=2.0, tilt_angles_deg=(0, 15, 30)):
     centered = verts - verts.mean(axis=0)
     _, _, Vt = np.linalg.svd(centered, full_matrices=False)
 
-    thin_axis = Vt[2]
+    # Vt rows: [max-variance axis, mid-variance axis, min-variance axis]
+    thin_axis = Vt[2]   # unit vector normal to the flat face
     mid_axis  = Vt[1]
     maj_axis  = Vt[0]
 
@@ -69,11 +73,14 @@ def pca_viewpoints(mesh_norm, radius=2.0, tilt_angles_deg=(0, 15, 30)):
     for tilt_deg in tilt_angles_deg:
         tilt = np.deg2rad(tilt_deg)
         if tilt_deg == 0:
+            # just the two poles along thin axis
             add( thin_axis)
             add(-thin_axis)
         else:
+            # ring of tilted views around thin axis at 4 azimuthal positions
             for az_deg in (0, 90, 180, 270):
                 az  = np.deg2rad(az_deg)
+                # tilt away from thin_axis toward (cos(az)*maj + sin(az)*mid)
                 perp = np.cos(az) * maj_axis + np.sin(az) * mid_axis
                 eye  = np.cos(tilt) * thin_axis + np.sin(tilt) * perp
                 add( eye)
@@ -83,10 +90,14 @@ def pca_viewpoints(mesh_norm, radius=2.0, tilt_angles_deg=(0, 15, 30)):
     return viewpoints
 
 
+# ── silhouette area utility ───────────────────────────────────────────────────
+
 def projected_area(render):
     sil = silhouette_from_render(render["clay_img"])
     return (sil > 0).sum()
 
+
+# ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser()
@@ -103,6 +114,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     size = 512
 
+    # ── load viewfinder ───────────────────────────────────────────────────
     print("\n[1] Loading viewfinder...")
     xml_path = None
     if args.hdr:
@@ -112,6 +124,7 @@ def main():
     viewfinder = load_viewfinder(args.viewfinder, args.hdr, args.raw, xml_path)
     viewfinder = cv2.resize(viewfinder, (size, size))
 
+    # ── load + rotate mask ────────────────────────────────────────────────
     print("[2] Loading mask...")
     vf_mask = cv2.imread(args.mask, cv2.IMREAD_GRAYSCALE)
     angle = parse_datacube_angle(xml_path)
@@ -123,6 +136,7 @@ def main():
     _, vf_mask = cv2.threshold(vf_mask, 127, 255, cv2.THRESH_BINARY)
     print(f"  Coverage: {(vf_mask > 0).mean()*100:.1f}%")
 
+    # ── load mesh ─────────────────────────────────────────────────────────
     print("[3] Loading mesh...")
     mesh = trimesh.load(str(args.mesh), force="mesh")
     print(f"  Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
@@ -136,11 +150,13 @@ def main():
 
     flatness = compute_flatness_scores(mesh)
 
+    # ── generate PCA viewpoints & render ─────────────────────────────────
     print("\n[4] PCA-driven viewpoints...")
     viewpoints = pca_viewpoints(mesh_norm)
     renders    = render_clay_views(mesh_norm, flatness, viewpoints, size=size)
     print(f"  Rendered {len(renders)} views")
 
+    # save renders for inspection
     renders_dir = out / "pca_renders"
     renders_dir.mkdir(exist_ok=True)
     areas = []
@@ -156,10 +172,12 @@ def main():
     print(f"\n  Largest projected area: render {best_by_area} "
           f"({areas[best_by_area]}px)")
 
+    # ── silhouette matching ───────────────────────────────────────────────
     print("\n[5] Silhouette matching...")
     best_idx, _, best_iou, best_M, aligned_sil = \
         find_best_render_by_silhouette(vf_mask, renders)
 
+    # ── warp flatness map ─────────────────────────────────────────────────
     flat_gray = cv2.cvtColor(
         renders[best_idx]["flat_img"], cv2.COLOR_RGB2GRAY
     ).astype(np.float32) / 255.0
@@ -172,6 +190,7 @@ def main():
     coverage = (flatness_hsi > 0.01).mean() * 100
     print(f"  Flatness coverage: {coverage:.1f}%")
 
+    # ── debug image ───────────────────────────────────────────────────────
     save_debug_image(out, viewfinder, vf_mask,
                      renders[best_idx]["clay_img"], aligned_sil,
                      flatness_hsi, best_iou, label="_pca")

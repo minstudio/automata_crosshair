@@ -346,6 +346,13 @@ def run_hdbscan_clustering(cube, mask_u8, output_prefix,
         if edge_frac > 0.50:
             label_img[cluster_pixels] = -1
             continue
+        labeled_cc, n_cc = ndimage.label(cluster_pixels)
+        if n_cc > 1:
+            cc_sizes = ndimage.sum(cluster_pixels, labeled_cc, range(1, n_cc + 1))
+            largest_cc = int(np.argmax(cc_sizes) + 1)
+            small_cc = cluster_pixels & (labeled_cc != largest_cc)
+            if int(np.sum(small_cc)) > 0:
+                label_img[small_cc] = -1
         keep_ids.append(cid)
 
     unclustered = mask_binary & ~np.isin(label_img, keep_ids)
@@ -563,6 +570,13 @@ def run_clustering(cube, mask_u8, output_prefix,
         if edge_frac > 0.50:
             label_img[cluster_pixels] = -1
             continue
+        labeled_cc, n_cc = ndimage.label(cluster_pixels)
+        if n_cc > 1:
+            cc_sizes = ndimage.sum(cluster_pixels, labeled_cc, range(1, n_cc + 1))
+            largest_cc = int(np.argmax(cc_sizes) + 1)
+            small_cc = cluster_pixels & (labeled_cc != largest_cc)
+            if int(np.sum(small_cc)) > 0:
+                label_img[small_cc] = -1
         keep_ids.append(cid)
 
     unclustered = mask_binary & ~np.isin(label_img, keep_ids)
