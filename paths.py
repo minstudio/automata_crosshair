@@ -5,10 +5,12 @@ All scripts and notebooks should import paths from here instead of hardcoding th
 Usage:
     from paths import DATASET_ROOT, XRF_STANDALONE_ROOT, RAMAN_STANDALONE_ROOT, ...
 """
+import os
 from pathlib import Path
 
 AUTOMATA_ROOT = Path(__file__).resolve().parent
 DATASET_ROOT  = AUTOMATA_ROOT / "dataset"
+DATASET_ROOT  = Path(os.environ["AUTOMATA_DATASET"]) if os.environ.get("AUTOMATA_DATASET") else DATASET_ROOT
 
 # ── Unified standalone XRF collections ────────────────────────────────────
 XRF_STANDALONE_ROOT      = Path(r"C:\Users\leona\Downloads\xrf_standalone")

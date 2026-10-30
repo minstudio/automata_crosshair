@@ -10,6 +10,7 @@ Usage:
     python hsi/run_roi_clustering.py --artifacts lot1n1 lot2n15
 """
 
+import glob
 import os
 import sys
 import argparse
@@ -67,6 +68,15 @@ def _mask_bbox(mask_u8, pad=20):
     )
 
 
+def _save_preview(img, output_path):
+    """Save a preview PNG; a locked/unwritable file only warns (Windows keeps files
+    open in viewers, which makes overwriting fail)."""
+    try:
+        img.save(output_path)
+    except OSError as e:
+        print(f"  Warning: could not write {output_path} ({e}). Is it open in another program?")
+
+
 def _draw_mask_boundary(img_array, mask_2d, color=(0, 255, 0)):
     from scipy import ndimage
     boundary = mask_2d & ~ndimage.binary_erosion(mask_2d, iterations=1)
@@ -82,14 +92,14 @@ def save_cropped_with_outline(reflectance_path, mask_u8, output_path, pad=20):
 
     bbox = _mask_bbox(mask_u8, pad)
     if bbox is None:
-        rgb.save(output_path)
+        _save_preview(rgb, output_path)
         return
     x0, y0, x1, y1 = bbox
 
     arr = np.array(rgb.crop((x0, y0, x1, y1)))
     mask_crop = mask_u8[y0:y1, x0:x1] > 127
     _draw_mask_boundary(arr, mask_crop)
-    Image.fromarray(arr).save(output_path)
+    _save_preview(Image.fromarray(arr), output_path)
 
 
 def save_cluster_overlay_crop(reflectance_path, hdbscan_png_path, mask_u8,
@@ -125,7 +135,7 @@ def save_cluster_overlay_crop(reflectance_path, hdbscan_png_path, mask_u8,
         x0, y0, x1, y1 = bbox
         out = out[y0:y1, x0:x1]
 
-    Image.fromarray(out).save(output_path)
+    _save_preview(Image.fromarray(out), output_path)
 
 DEFAULT_ROI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "roi")
 DEFAULT_OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "roi_clustered")
@@ -141,10 +151,17 @@ def main():
     parser.add_argument("--min-samples", type=int, default=None, help="HDBSCAN/OPTICS min_samples (default: auto)")
     parser.add_argument("--epsilon", type=float, default=0.3, help="HDBSCAN cluster_selection_epsilon (default: 0.3)")
     parser.add_argument("--method", default="eom", choices=["eom", "leaf"], help="HDBSCAN cluster_selection_method (default: eom)")
-    parser.add_argument("--algorithm", default="hdbscan",
-                        choices=["hdbscan", "kmeans", "gmm", "agglomerative", "optics",
+    parser.add_argument("--algorithm", default="auto",
+                        choices=["auto", "hdbscan", "kmeans", "gmm", "agglomerative", "optics",
                                  "meanshift", "bgmm", "otsu"],
-                        help="Clustering algorithm (default: hdbscan)")
+                        help="Clustering algorithm (default: auto = HDBSCAN on boundary-free "
+                             "pixels, number of clusters found automatically)")
+    parser.add_argument("--intensity-weight", type=float, default=0.5,
+                        help="auto: weight of log brightness next to spectral shape "
+                             "(0 = shape only, ignores shading; default: 0.5)")
+    parser.add_argument("--pure-quantile", type=float, default=50.0,
+                        help="auto: fit on pixels whose spectral gradient is below this "
+                             "percentile, i.e. away from region boundaries (default: 50)")
     parser.add_argument("--n-clusters", type=int, default=5, help="Number of clusters for kmeans/gmm/agglomerative (default: 5)")
     parser.add_argument("--linkage", default="ward", choices=["ward", "complete", "average", "single"],
                         help="Agglomerative linkage (default: ward)")
@@ -164,7 +181,21 @@ def main():
     parser.add_argument("--segment-sigma", type=float, default=0.8, help="Felzenszwalb/watershed Gaussian blur sigma (default: 0.8)")
     parser.add_argument("--merge-small", type=float, default=0.0, help="Merge clusters smaller than this fraction of total ROI into nearest large cluster (e.g. 0.05 = merge clusters < 5%%)")
     parser.add_argument("--min-roi-pixels", type=int, default=1000, help="ROIs smaller than this pixel count are output as a single cluster (default: 1000)")
+    parser.add_argument("--source", default=None, choices=["raw", "reflectance"],
+                        help="Cube to cluster: raw capture DN or the camera-calibrated "
+                             "HSI/raw_data/results/REFLECTANCE_*.dat (falls back to raw if missing). "
+                             "Default: reflectance for --algorithm auto, raw otherwise")
+    parser.add_argument("--smooth", type=int, default=None,
+                        help="Spatial mean filter size (px) applied to every band before clustering. "
+                             "Default: 3 for --algorithm auto, 0 (off) otherwise")
     args = parser.parse_args()
+    if args.superpixel and args.algorithm == "auto":
+        print("Note: --superpixel does not support --algorithm auto, using hdbscan")
+        args.algorithm = "hdbscan"
+    if args.source is None:
+        args.source = "reflectance" if args.algorithm == "auto" else "raw"
+    if args.smooth is None:
+        args.smooth = 3 if args.algorithm == "auto" else 0
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -200,11 +231,23 @@ def main():
         except FileNotFoundError as e:
             print(f"  SKIP — {e}")
             continue
+        if args.source == "reflectance":
+            refl = sorted(glob.glob(os.path.join(hsi_dir, "raw_data", "results", "REFLECTANCE_*.dat")))
+            refl_hdr = os.path.splitext(refl[0])[0] + ".hdr" if refl else None
+            if refl and os.path.exists(refl_hdr):
+                raw_file, hdr_file = refl[0], refl_hdr
+                print(f"  source: {os.path.basename(raw_file)}")
+            else:
+                print("  source: REFLECTANCE_*.dat not found, using raw capture")
 
         cube = read_hsi_cube(raw_file, hdr_file)
         if cube is None:
             print(f"  SKIP — failed to read HSI cube")
             continue
+        if args.smooth and args.smooth > 1:
+            from scipy.ndimage import uniform_filter
+            cube = uniform_filter(cube.astype(np.float32), size=(args.smooth, args.smooth, 1))
+            print(f"  spatial smoothing: {args.smooth}x{args.smooth}")
 
         # mask_orig is in viewfinder/REFLECTANCE-PNG coords (for visual crops)
         mask_orig = np.array(Image.open(mask_path).convert("L"))
@@ -318,6 +361,8 @@ def main():
                     lab_image=lab_cube if not args.pixel_mode else None,
                     pixel_mix_weight=args.pixel_weight,
                     spatial_weight=args.spatial_weight,
+                    intensity_weight=args.intensity_weight,
+                    pure_quantile=args.pure_quantile,
                 )
             print(f"  OK — {k} clusters, {n_targets} Raman targets")
             if refl_path:

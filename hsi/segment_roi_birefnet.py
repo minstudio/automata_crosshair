@@ -330,6 +330,8 @@ def main():
                     help="Batch over all artifact folders that have HSI data")
     ap.add_argument("--output_dir", default="hsi/output",
                     help="Output directory (batch mode, default: hsi/output)")
+    ap.add_argument("--dataset", default=str(DATASET_ROOT),
+                    help="Dataset root for batch mode (one folder per artifact)")
     ap.add_argument("--artifacts", nargs="+", default=None,
                     help="In batch mode, only process these artifact folders "
                          "(e.g. --artifacts lot1n1 lot2n15)")
@@ -360,7 +362,7 @@ def main():
         # ── batch mode ────────────────────────────────────────────────────
         required = {"HSI"} if args.hsi_only else {"HSI", "photogrammetry", "pXRF", "Raman"}
         folders = sorted(
-            f for f in DATASET_ROOT.iterdir()
+            f for f in Path(args.dataset).iterdir()
             if f.is_dir() and required.issubset(
                 {d.name for d in f.iterdir() if d.is_dir()}
             )

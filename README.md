@@ -20,7 +20,7 @@ Windows shortcut: `run_crosshair_generation.bat` installs the mesh dependencies 
 
 ## Expected dataset structure
 
-`paths.py` defines `DATASET_ROOT`, which defaults to `./dataset` next to this README. Either place your data there or override it with each script's `--dataset` argument (or edit `paths.py`).
+`paths.py` defines `DATASET_ROOT`, which defaults to `./dataset` next to this README. Override it for all scripts with the `AUTOMATA_DATASET` environment variable, per script with `--dataset`, or edit `paths.py`.
 
 One folder per artifact, named after the artifact (e.g. `lot1n1`). Only HSI and photogrammetry data are required:
 
@@ -43,6 +43,8 @@ dataset/
         └── raw_data/
             └── <name>.obj                   # 3D mesh (+ .mtl / textures alongside)
 ```
+
+The mesh is looked up in `photogrammetry/raw_data/` first, then `photogrammetry/processed_data/` (e.g. the pipeline's `textured_mesh.glb`). Formats: `.obj`, `.glb`/`.gltf`, `.ply`. Units (m, cm or mm) are detected from the mesh size; output points are in cm in the mesh's own frame.
 
 `HSI/capture/` (without `raw_data`) is also accepted as a fallback.
 
@@ -80,29 +82,38 @@ Note: mask filenames must be `<artifact>_mask.png` for the later steps to find t
 
 ### Step 2 - HSI clustering inside the ROI
 
-Clusters the HSI cube pixels under each verified mask (HDBSCAN on PCA-reduced, SNV-normalised spectra by default) and writes `<artifact>_clusters.png` maps.
+Clusters the HSI cube pixels under each verified mask and writes `<artifact>_clusters.png` maps.
+
+Default `--algorithm auto` (number of clusters found automatically):
+
+1. Features per pixel: SNV spectral shape reduced to 5 PCA components, plus log brightness at half weight (`--intensity-weight`, default 0.5).
+2. Pixels near region boundaries (mixed spectra) are excluded from the fit: only the half with the lowest spectral gradient is used (`--pure-quantile`, default 50).
+3. HDBSCAN on those pixels decides the clusters; every other pixel is assigned by 15-nearest-neighbour vote in feature space.
+4. By default the cube is the calibrated reflectance (`--source reflectance`, `--source raw` for the raw capture) with 3x3 spatial smoothing (`--smooth`).
 
 ```bash
 python hsi/run_roi_clustering.py
 ```
 
-Useful options: `--artifacts lot1n1 lot2n15` to process specific artifacts, `--dataset <path>` to override the dataset root, `--algorithm {hdbscan,kmeans,gmm,agglomerative,optics}`, `--superpixel` for SLIC superpixel clustering, `--merge-small 0.05` to merge tiny clusters, `--spatial-weight` / `--pixel-weight` to mix spatial or visual features into the spectra. Run with `-h` for the full list.
+Useful options: `--artifacts lot1n1 lot2n15` to process specific artifacts, `--dataset <path>` to override the dataset root, `--algorithm {auto,hdbscan,kmeans,gmm,agglomerative,optics,...}` (the non-auto ones use the previous pipeline: raw cube, no smoothing unless `--smooth` is given), `--superpixel` for SLIC superpixel clustering, `--merge-small 0.05` to merge tiny clusters, `--spatial-weight` / `--pixel-weight` to mix spatial or visual features into the spectra. Run with `-h` for the full list.
+
+Also: `--source reflectance` clusters the camera-calibrated `REFLECTANCE_*.dat` instead of the raw capture, `--smooth 3` applies a 3x3 spatial mean before clustering. Clusters may span several separate regions (repeated decoration); only specks under 1% of the ROI are dropped and reassigned to the nearest cluster.
 
 ### Step 3 - Crosshair generation on the 3D mesh
 
-Registers each cluster map onto the artifact's mesh (silhouette matching over PCA-selected viewpoints), scores surface flatness, and picks the best measurement points per cluster. XRF uses BFS flat-region search with a soft rim penalty; Raman reuses XRF points that fall in a cluster and fills the rest at the flattest blob pixel away from rims and other clusters. `--all` processes every artifact that has both a cluster map and an OBJ.
+Registers each cluster map onto the artifact's mesh (silhouette matching over PCA-selected viewpoints), scores surface flatness, and picks the best measurement points per cluster. XRF uses BFS flat-region search, restricted to the surface visible from the HSI viewpoint, with a soft rim penalty; Raman reuses XRF points that fall in a cluster and fills the rest at the flattest blob pixel away from rims and other clusters. `--all` processes every artifact that has both a cluster map and an OBJ.
 
 ```bash
 python photogrammetry/analyze_hsi_clusters.py --all
 python photogrammetry/analyze_hsi_clusters.py --artifact lot1n1
 ```
 
-Useful options: `--xrf-only` to skip Raman targets, `--min-crosshairs N` (clusters with fewer viable targets are skipped), `--rim-dist` / `--rim-angle` to keep points away from rims (`--no-rim` to disable), `--cluster-gap-px` to keep Raman points away from other clusters, `--xrf-share-cm` / `--no-xrf-share` for reusing XRF points as Raman targets, `--raman-centroid` for blob-centroid Raman placement, `--grid-size` for registration resolution, `--output <dir>` to redirect results.
+Useful options: `--xrf-only` to skip Raman targets, `--min-crosshairs N` (clusters with fewer viable targets are skipped), `--rim-dist` / `--rim-angle` to keep points away from rims (`--no-rim` to disable), `--cluster-gap-px` to keep Raman points away from other clusters, `--raman-core` (0.5) to keep Raman points in the interior of each cluster blob, `--xrf-share-cm` / `--no-xrf-share` for reusing XRF points as Raman targets, `--raman-centroid` for blob-centroid Raman placement, `--grid-size` for registration resolution, `--output <dir>` to redirect results.
 
 Output per artifact in `photogrammetry/output/hsi_clusters/`:
 
 ```
-<artifact>_xrf.ply                    # flatness heatmap + ranked XRF target squares
+<artifact>_xrf.ply                    # mesh texture (or flatness heatmap, --xrf-base flatness) + ranked XRF target squares
 <artifact>_raman.ply                  # Raman targets
 <artifact>_hsi_clusters_regions.ply   # cluster regions painted on the mesh
 ```

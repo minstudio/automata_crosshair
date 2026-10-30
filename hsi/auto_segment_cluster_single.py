@@ -85,6 +85,55 @@ def find_hsi_files(capture_path):
     return os.path.join(capture_path, raw_file), os.path.join(capture_path, hdr_file)
 
 
+MIN_CC_FRAC = 0.01
+
+
+def clean_cluster_labels(label_img, mask_binary, cluster_ids, near_edge):
+    """Remove speckle and edge-only clusters, then give leftover pixels to the
+    nearest kept cluster.
+
+    A cluster may legitimately span several separate regions (e.g. repeated
+    painted stripes), so every connected component at least
+    max(MIN_CLUSTER_AREA_PX, MIN_CC_FRAC * mask area) pixels is kept; only
+    smaller specks are dropped. Clusters with more than half their pixels in the
+    mask edge band are dropped. Dropped / unclustered pixels inside the mask are
+    reassigned to the nearest kept cluster; if nothing is kept, they become a
+    single cluster."""
+    min_cc = max(MIN_CLUSTER_AREA_PX, int(MIN_CC_FRAC * int(mask_binary.sum())))
+    keep_ids = []
+    for cid in cluster_ids:
+        cluster_pixels = label_img == cid
+        total = int(np.sum(cluster_pixels))
+        if total < MIN_CLUSTER_AREA_PX:
+            label_img[cluster_pixels] = -1
+            continue
+        edge_frac = float(np.sum(cluster_pixels & near_edge) / max(total, 1))
+        if edge_frac > 0.50:
+            label_img[cluster_pixels] = -1
+            continue
+        labeled_cc, n_cc = ndimage.label(cluster_pixels)
+        if n_cc > 1:
+            cc_sizes = ndimage.sum(cluster_pixels, labeled_cc, range(1, n_cc + 1))
+            small_ids = np.where(np.asarray(cc_sizes) < min_cc)[0] + 1
+            if len(small_ids):
+                label_img[np.isin(labeled_cc, small_ids)] = -1
+        elif total < min_cc:
+            label_img[cluster_pixels] = -1
+        if np.any(label_img == cid):
+            keep_ids.append(cid)
+
+    unclustered = mask_binary & ~np.isin(label_img, keep_ids)
+    if np.any(unclustered):
+        if keep_ids:
+            kept = np.isin(label_img, keep_ids)
+            _, (iy, ix) = ndimage.distance_transform_edt(~kept, return_indices=True)
+            label_img[unclustered] = label_img[iy[unclustered], ix[unclustered]]
+        else:
+            label_img[unclustered] = 0
+            keep_ids.append(0)
+    return label_img, keep_ids
+
+
 def largest_component(binary):
     labeled, n = ndimage.label(binary)
     if n == 0:
@@ -335,32 +384,8 @@ def run_hdbscan_clustering(cube, mask_u8, output_prefix,
     mask_eroded_edge = ndimage.binary_erosion(mask_binary, iterations=edge_band)
     near_edge = mask_binary & ~mask_eroded_edge
 
-    keep_ids = []
     cluster_ids = sorted([l for l in set(full_labels) if l >= 0])
-    for cid in cluster_ids:
-        cluster_pixels = label_img == cid
-        total = int(np.sum(cluster_pixels))
-        if total < MIN_CLUSTER_AREA_PX:
-            continue
-        edge_frac = float(np.sum(cluster_pixels & near_edge) / max(total, 1))
-        if edge_frac > 0.50:
-            label_img[cluster_pixels] = -1
-            continue
-        labeled_cc, n_cc = ndimage.label(cluster_pixels)
-        if n_cc > 1:
-            cc_sizes = ndimage.sum(cluster_pixels, labeled_cc, range(1, n_cc + 1))
-            largest_cc = int(np.argmax(cc_sizes) + 1)
-            small_cc = cluster_pixels & (labeled_cc != largest_cc)
-            if int(np.sum(small_cc)) > 0:
-                label_img[small_cc] = -1
-        keep_ids.append(cid)
-
-    unclustered = mask_binary & ~np.isin(label_img, keep_ids)
-    unclust_count = int(np.sum(unclustered))
-    if unclust_count >= MIN_NOISE_PROMOTE_PX:
-        next_id = int((max(keep_ids) + 1) if keep_ids else 0)
-        label_img[unclustered] = next_id
-        keep_ids.append(next_id)
+    label_img, keep_ids = clean_cluster_labels(label_img, mask_binary, cluster_ids, near_edge)
 
     keep_ids = list(dict.fromkeys(keep_ids))
     remap = {old: new for new, old in enumerate(keep_ids)}
@@ -395,6 +420,70 @@ def run_hdbscan_clustering(cube, mask_u8, output_prefix,
     return k, len(targets)
 
 
+def auto_cluster_labels(cube, mask_binary, valid_local, intensity_weight=0.5,
+                        pure_quantile=50.0, n_pca=5, min_cluster_frac=0.02,
+                        min_samples=10, band_trim=0.05):
+    """Cluster without a preset number of clusters.
+
+    Features: SNV spectral shape -> PCA (scaled so PC1 has unit std, relative
+    variances kept) + intensity_weight * z-scored log mean reflectance.
+    HDBSCAN is fitted only on "pure" pixels (spectral/intensity gradient at or
+    below the pure_quantile percentile), so mixed pixels on region boundaries
+    cannot bridge clusters. All valid pixels are then labelled by 15-NN.
+    Returns labels for cube[mask_binary][valid_local]."""
+    ys, xs = np.where(mask_binary)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    sub_mask = mask_binary[y0:y1, x0:x1]
+    b = cube.shape[2]
+    lo, hi = int(round(band_trim * b)), int(round((1.0 - band_trim) * b))
+    X = cube[y0:y1, x0:x1][sub_mask][:, lo:hi].astype(np.float32)
+    X = np.clip(X, 1e-6, None)
+    S = (X - X.mean(1, keepdims=True)) / (X.std(1, keepdims=True) + 1e-9)
+
+    img = np.zeros(sub_mask.shape + (S.shape[1],), dtype=np.float32)
+    img[sub_mask] = S
+    gy = np.linalg.norm(np.diff(img, axis=0, append=img[-1:]), axis=2)
+    gx = np.linalg.norm(np.diff(img, axis=1, append=img[:, -1:]), axis=2)
+    del img
+    log_i = np.log(X.mean(1))
+    li_img = np.zeros(sub_mask.shape, dtype=np.float32)
+    li_img[sub_mask] = log_i
+    gI = np.hypot(*np.gradient(li_img))
+    gs = ndimage.maximum_filter(gx + gy, 3)
+    gI = ndimage.maximum_filter(gI, 3)
+    grad = gs / (np.median(gs[sub_mask]) + 1e-9) + gI / (np.median(gI[sub_mask]) + 1e-9)
+    g = grad[sub_mask][valid_local]
+
+    Sv = S[valid_local]
+    n_comp = int(min(n_pca, Sv.shape[1], max(1, len(Sv) - 1)))
+    Z = PCA(n_components=n_comp, random_state=42).fit_transform(Sv)
+    Z = Z / (Z[:, 0].std() + 1e-9)
+    if intensity_weight > 0:
+        li = log_i[valid_local]
+        li = (li - li.mean()) / (li.std() + 1e-9)
+        Z = np.hstack([Z, intensity_weight * li[:, None]])
+
+    pure = g <= np.percentile(g, pure_quantile)
+    if pure.sum() < 50:
+        pure = np.ones(len(Z), dtype=bool)
+    Zp = Z[pure]
+    mcs = int(max(20, min_cluster_frac * len(Zp)))
+    try:
+        from sklearn.cluster import HDBSCAN as _HDB
+    except Exception:
+        from hdbscan import HDBSCAN as _HDB
+    hl = _HDB(min_cluster_size=mcs, min_samples=int(min(min_samples, mcs))).fit_predict(Zp)
+    fit = hl >= 0
+    n_found = len(set(hl[fit].tolist()))
+    print(f"  auto: {int(pure.sum())} pure px, HDBSCAN found {n_found} cluster(s), "
+          f"noise {100.0 * (1 - fit.mean()):.0f}%")
+    if n_found <= 1:
+        return np.zeros(len(Z), dtype=int)
+    from sklearn.neighbors import KNeighborsClassifier
+    knn = KNeighborsClassifier(n_neighbors=15).fit(Zp[fit], hl[fit])
+    return knn.predict(Z)
+
+
 def run_clustering(cube, mask_u8, output_prefix,
                    algorithm="hdbscan",
                    n_clusters=5,
@@ -409,7 +498,9 @@ def run_clustering(cube, mask_u8, output_prefix,
                    skip_specular=False,
                    lab_image=None,
                    pixel_mix_weight=0.0,
-                   spatial_weight=0.0):
+                   spatial_weight=0.0,
+                   intensity_weight=0.5,
+                   pure_quantile=50.0):
     """
     General clustering entry point. Supports: hdbscan, kmeans, gmm, agglomerative, optics.
     Saves {output_prefix}_clusters.png, _mask.png, _raman_targets.json.
@@ -479,7 +570,12 @@ def run_clustering(cube, mask_u8, output_prefix,
     n_valid = valid_pixels.shape[0]
     algo = algorithm.lower()
 
-    if algo == "hdbscan":
+    if algo == "auto":
+        valid_labels = auto_cluster_labels(cube, mask_binary, ~specular_local,
+                                           intensity_weight=intensity_weight,
+                                           pure_quantile=pure_quantile)
+
+    elif algo == "hdbscan":
         try:
             from hdbscan import HDBSCAN
         except Exception:
@@ -559,32 +655,8 @@ def run_clustering(cube, mask_u8, output_prefix,
     mask_eroded_edge = ndimage.binary_erosion(mask_binary, iterations=edge_band)
     near_edge = mask_binary & ~mask_eroded_edge
 
-    keep_ids = []
     cluster_ids = sorted([l for l in set(full_labels) if l >= 0])
-    for cid in cluster_ids:
-        cluster_pixels = label_img == cid
-        total = int(np.sum(cluster_pixels))
-        if total < MIN_CLUSTER_AREA_PX:
-            continue
-        edge_frac = float(np.sum(cluster_pixels & near_edge) / max(total, 1))
-        if edge_frac > 0.50:
-            label_img[cluster_pixels] = -1
-            continue
-        labeled_cc, n_cc = ndimage.label(cluster_pixels)
-        if n_cc > 1:
-            cc_sizes = ndimage.sum(cluster_pixels, labeled_cc, range(1, n_cc + 1))
-            largest_cc = int(np.argmax(cc_sizes) + 1)
-            small_cc = cluster_pixels & (labeled_cc != largest_cc)
-            if int(np.sum(small_cc)) > 0:
-                label_img[small_cc] = -1
-        keep_ids.append(cid)
-
-    unclustered = mask_binary & ~np.isin(label_img, keep_ids)
-    unclust_count = int(np.sum(unclustered))
-    if unclust_count >= MIN_NOISE_PROMOTE_PX:
-        next_id = int((max(keep_ids) + 1) if keep_ids else 0)
-        label_img[unclustered] = next_id
-        keep_ids.append(next_id)
+    label_img, keep_ids = clean_cluster_labels(label_img, mask_binary, cluster_ids, near_edge)
 
     keep_ids = list(dict.fromkeys(keep_ids))
     remap = {old: new for new, old in enumerate(keep_ids)}

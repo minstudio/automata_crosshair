@@ -3,3 +3,5 @@ __pycache__/
 dataset/
 hsi/output/
 photogrammetry/output/
+
+_tmp*/

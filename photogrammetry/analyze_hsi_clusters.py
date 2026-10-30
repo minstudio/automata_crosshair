@@ -155,7 +155,8 @@ def find_flat_regions(vertices, faces, face_areas, N, H, concave,
                       min_region_vertex_count=30,
                       target_sensor_area_sq_cm=2.0,
                       curvature_tolerance_factor=10.0,
-                      concave_penalty_factor=50.0):
+                      concave_penalty_factor=50.0,
+                      allowed=None):
     """
     BFS region grower that finds macroscopic flat convex patches.
     Seeds from the lowest-curvature vertices; expands while neighbours
@@ -166,8 +167,13 @@ def find_flat_regions(vertices, faces, face_areas, N, H, concave,
     from collections import deque
 
     n = len(vertices)
-    k = max(1, int(n * curvature_percent / 100))
-    low_curv_idx = np.argpartition(H, k)[:k]
+    if allowed is not None:
+        cand = np.where(allowed)[0]
+        k = max(1, min(len(cand) - 1, int(len(cand) * curvature_percent / 100)))
+        low_curv_idx = cand[np.argpartition(H[cand], k)[:k]] if len(cand) > 1 else cand
+    else:
+        k = max(1, int(n * curvature_percent / 100))
+        low_curv_idx = np.argpartition(H, k)[:k]
 
     adjacency      = _vertex_adjacency(faces, n)
     vtf            = _vertex_to_faces(faces, n)
@@ -191,6 +197,8 @@ def find_flat_regions(vertices, faces, face_areas, N, H, concave,
             v = queue.popleft()
             for nb in adjacency[v]:
                 if visited[nb]:
+                    continue
+                if allowed is not None and not allowed[nb]:
                     continue
                 if H[nb] > max_h:
                     continue
@@ -586,8 +594,9 @@ def _flattest_pixel_in_blob(blob_yx, M_inv, face_buf, grid, face_flatness, valid
 
 def _best_pixel_in_blob(blob_yx, cy, cx, M_inv, face_buf, grid, mesh_cm,
                         face_flatness, valid_arr, rim_tree, min_rim_dist,
-                        d_other, min_other_dist_px):
-    """Pixel of the blob minimising normalised flatness (or centroid distance when
+                        d_other, min_other_dist_px, core_frac=0.5):
+    """Only pixels in the blob core (interior depth >= core_frac * max depth) are
+    candidates, so targets sit away from cluster edges. Among them: pixel of the blob minimising normalised flatness (or centroid distance when
     face_flatness is None) + 2 * rim penalty + 1 * other-cluster penalty.
     Returns (py, px, flat_score, rim_d, oth_def) or None if nothing maps to the mesh."""
     fi = _blob_pixels_to_faces(blob_yx, M_inv, face_buf, grid)
@@ -596,6 +605,16 @@ def _best_pixel_in_blob(blob_yx, cy, cx, M_inv, face_buf, grid, mesh_cm,
         ok &= valid_arr[np.clip(fi, 0, len(valid_arr) - 1)]
     if not ok.any():
         return None
+    if core_frac > 0 and len(blob_yx) > 4:
+        by, bx = blob_yx[:, 0].astype(int), blob_yx[:, 1].astype(int)
+        y0, x0 = by.min() - 8, bx.min() - 8
+        bm = np.zeros((by.max() - y0 + 9, bx.max() - x0 + 9), dtype=np.uint8)
+        bm[by - y0, bx - x0] = 1
+        bm = cv2.morphologyEx(bm, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        depth = cv2.distanceTransform(bm, cv2.DIST_L2, 3)[by - y0, bx - x0]
+        core = depth >= core_frac * depth[ok].max() if ok.any() else depth > 0
+        if (ok & core).any():
+            ok &= core
     fic = np.clip(fi, 0, len(mesh_cm.faces) - 1)
     ys = blob_yx[:, 0].astype(float)
     xs = blob_yx[:, 1].astype(float)
@@ -631,7 +650,7 @@ def _best_pixel_in_blob(blob_yx, cy, cx, M_inv, face_buf, grid, mesh_cm,
 def find_raman_targets(vertices, N, mask_cube, best_M, face_buf, mesh_cm,
                        n_points=3, min_points=2, grid=256, valid_fi=None,
                        flatness=None, rim_tree=None, min_rim_dist=1.0,
-                       other_mask=None, min_other_dist_px=16):
+                       other_mask=None, min_other_dist_px=16, core_frac=0.5):
     """
     Find Raman targets from the n_points largest 2D blobs in the cluster mask.
 
@@ -704,7 +723,7 @@ def find_raman_targets(vertices, N, mask_cube, best_M, face_buf, mesh_cm,
         py, px = cy, cx
         best = _best_pixel_in_blob(blob_yx, cy, cx, M_inv, face_buf, grid, mesh_cm,
                                    face_flatness, valid_arr, rim_tree, min_rim_dist,
-                                   d_other, min_other_dist_px)
+                                   d_other, min_other_dist_px, core_frac=core_frac)
         if best is not None:
             py, px, flat_score, rim_d, oth_def = best
 
@@ -765,9 +784,64 @@ def draw_plus(vertices, N, target, colors, color, outline_color, label_num=None)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+MESH_EXTS = (".obj", ".glb", ".gltf", ".ply")
+
+
+def find_mesh(art_dir):
+    """Locate the artifact mesh. Checks photogrammetry/raw_data then
+    photogrammetry/processed_data, preferring .obj, then .glb/.gltf, then .ply.
+    Files named like crosshair outputs are ignored."""
+    photo = art_dir / "photogrammetry"
+    for sub in ("raw_data", "processed_data"):
+        d = photo / sub
+        if not d.exists():
+            continue
+        for ext in MESH_EXTS:
+            hits = sorted(f for f in d.glob(f"*{ext}")
+                          if not any(t in f.stem for t in ("_xrf", "_raman", "_hsi_clusters")))
+            if hits:
+                tex = [f for f in hits if "textured" in f.stem]
+                return (tex or hits)[0]
+    return None
+
+
+def load_mesh(mesh_path):
+    """Load a mesh file as a single Trimesh, applying scene transforms (GLB/GLTF)."""
+    raw = trimesh.load(str(mesh_path))
+    if isinstance(raw, trimesh.Scene):
+        if hasattr(raw, "to_geometry"):
+            return raw.to_geometry()
+        return raw.dump(concatenate=True)
+    return raw
+
+
+def mesh_texture_colors(mesh):
+    """Per-vertex RGB (uint8, Nx3) from the mesh's texture or vertex colours,
+    or None if the mesh has neither."""
+    vis = getattr(mesh, "visual", None)
+    if vis is None:
+        return None
+    try:
+        if vis.kind == "texture" and getattr(vis, "uv", None) is not None:
+            cols = vis.to_color().vertex_colors
+        elif vis.kind == "vertex":
+            cols = vis.vertex_colors
+        else:
+            return None
+        cols = np.asarray(cols)[:, :3].astype(np.uint8)
+        if len(cols) != len(mesh.vertices) or cols.std() < 1.0:
+            return None
+        return cols
+    except Exception as e:
+        print(f"    [!] could not read mesh texture ({e})")
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--artifact",      default="lot1n1")
+    ap.add_argument("--dataset",       default=str(DATASET_ROOT),
+                    help="Dataset root (one folder per artifact)")
     ap.add_argument("--clusters-dir",  default=None,
                     help="Directory with *_clusters.png")
     ap.add_argument("--output",        default=None)
@@ -793,6 +867,12 @@ def main():
     ap.add_argument("--cluster-gap-px", type=int, default=16,
                     help="Preferred min distance (cube px) between a Raman target "
                          "and other clusters (soft constraint)")
+    ap.add_argument("--raman-core", type=float, default=0.5,
+                    help="Raman targets only in the blob interior: pixels at least this "
+                         "fraction of the blob's max depth from its edge (0 = off, default 0.5)")
+    ap.add_argument("--xrf-base", default="texture", choices=["texture", "flatness"],
+                    help="Background of the XRF PLY: the mesh's own texture (default, falls "
+                         "back to flatness if the mesh has none) or the flatness heatmap")
     ap.add_argument("--no-rim", action="store_true",
                     help="Disable rim avoidance (cluster-gap penalty still applies)")
     ap.add_argument("--all", action="store_true",
@@ -842,7 +922,7 @@ def run_all(args):
 def process_artifact(art, args):
     """Run the full crosshair pipeline for one artifact.
     Returns True on success, False if required inputs are missing (skip)."""
-    root = Path(DATASET_ROOT)
+    root = Path(args.dataset)
     art_dir = root / art
     script_dir = Path(__file__).resolve().parent.parent
 
@@ -860,12 +940,11 @@ def process_artifact(art, args):
         print(f"  SKIP: {clusters_png} not found"); return False
 
     # ── Mesh ──────────────────────────────────────────────────────────────────
-    photo_raw = art_dir / "photogrammetry" / "raw_data"
-    obj_files = sorted(photo_raw.glob("*.obj"))
-    if not obj_files:
-        print(f"  SKIP: no .obj under {photo_raw}"); return False
-    mesh_path = obj_files[0]
-    print(f"\n[mesh] {mesh_path.name}")
+    mesh_path = find_mesh(art_dir)
+    if mesh_path is None:
+        print(f"  SKIP: no mesh ({', '.join(MESH_EXTS)}) under {art_dir / 'photogrammetry'}")
+        return False
+    print(f"\n[mesh] {mesh_path.relative_to(art_dir)}")
 
     # ── HSI metadata ──────────────────────────────────────────────────────────
     hsi_raw   = art_dir / "HSI" / "raw_data"
@@ -896,13 +975,12 @@ def process_artifact(art, args):
 
     # ── Load + scale mesh ──────────────────────────────────────────────────────
     print("\n[1] Loading mesh...")
-    raw = trimesh.load(str(mesh_path))
-    if isinstance(raw, trimesh.Scene):
-        geoms = list(raw.geometry.values())
-        mesh = geoms[0] if len(geoms) == 1 else trimesh.util.concatenate(geoms)
-    else:
-        mesh = raw
+    mesh = load_mesh(mesh_path)
     print(f"    {len(mesh.vertices)} verts  {len(mesh.faces)} faces")
+    tex_colors = mesh_texture_colors(mesh) if args.xrf_base == "texture" else None
+    if args.xrf_base == "texture":
+        print("    texture colours: " + ("yes" if tex_colors is not None
+                                          else "none found, XRF PLY uses flatness heatmap"))
 
     # Normalised copy for registration / ray-casting
     mesh_norm = mesh.copy()
@@ -915,11 +993,11 @@ def process_artifact(art, args):
     mesh_cm = mesh.copy()
     max_dim = np.max(mesh_cm.bounds[1] - mesh_cm.bounds[0])
     if max_dim < 0.5:
-        mesh_cm.vertices *= 100.0; print("    Units: m -> x100 cm")
+        mesh_cm.vertices *= 100.0; mesh_units = "m";  print("    Units: m -> x100 cm")
     elif max_dim > 100:
-        mesh_cm.vertices *= 0.1;   print("    Units: mm -> x0.1 cm")
+        mesh_cm.vertices *= 0.1;   mesh_units = "mm"; print("    Units: mm -> x0.1 cm")
     else:
-        print("    Units: cm")
+        mesh_units = "cm"; print("    Units: cm")
 
     # ── Geometry ───────────────────────────────────────────────────────────────
     print("\n[2] Computing geometry...")
@@ -975,7 +1053,14 @@ def process_artifact(art, args):
     V_cm = mesh_cm.vertices
 
     # ── XRF: BFS region detection → flattest squares within best convex region ──
-    print("\n[6/xrf] BFS flat-region detection...")
+    print("\n[6/xrf] BFS flat-region detection (camera-visible surface only)...")
+    vis_faces = np.unique(face_buf[face_buf >= 0])
+    visible = np.zeros(len(V_cm), dtype=bool)
+    if len(vis_faces):
+        visible[np.unique(mesh_cm.faces[vis_faces].ravel())] = True
+    else:
+        visible[:] = True
+    print(f"  {int(visible.sum())} of {len(V_cm)} vertices visible from the HSI viewpoint")
     best_region_vi = find_flat_regions(
         V_cm, mesh_cm.faces, face_areas, N_arr, H_arr, concave,
         curvature_percent=50.0,
@@ -984,8 +1069,9 @@ def process_artifact(art, args):
         target_sensor_area_sq_cm=2.0,
         curvature_tolerance_factor=10.0,
         concave_penalty_factor=50.0,
+        allowed=visible,
     )
-    xrf_cand = best_region_vi if len(best_region_vi) else np.arange(len(V_cm))
+    xrf_cand = best_region_vi if len(best_region_vi) else np.where(visible)[0]
     print(f"  Searching {len(xrf_cand)} candidate vertices for XRF squares...")
     xrf_results = find_xrf_squares(V_cm, xrf_cand, N_arr, H_local,
                                    concave=concave, n_points=3, concave_penalty=50.0,
@@ -1084,7 +1170,8 @@ def process_artifact(art, args):
                                                   flatness=None if args.raman_centroid else flatness,
                                                   rim_tree=rim_tree, min_rim_dist=args.rim_dist,
                                                   other_mask=other_mask,
-                                                  min_other_dist_px=args.cluster_gap_px)
+                                                  min_other_dist_px=args.cluster_gap_px,
+                                                  core_frac=args.raman_core)
                 gap = 2.0 * 0.35
                 for t in blob_targets:
                     if len(targets) >= 3:
@@ -1148,7 +1235,7 @@ def process_artifact(art, args):
         np.array([255, 165,   0], dtype=np.uint8),  # rank 2 — orange
         np.array([255, 255,   0], dtype=np.uint8),  # rank 3 — yellow
     ]
-    xrf_colors = base_colors.copy()
+    xrf_colors = tex_colors.copy() if tex_colors is not None else base_colors.copy()
     for rank, xrf in enumerate(xrf_results):
         draw_crosshair(V_cm, N_arr, xrf, xrf_colors, XRF_COLORS[rank], label_num=rank + 1)
     xrf_ply = out_dir / f"{art}_xrf.ply"
@@ -1252,6 +1339,8 @@ def process_artifact(art, args):
         "rim_dist_cm": None if args.no_rim else args.rim_dist,
         "rim_angle_deg": None if args.no_rim else args.rim_angle,
         "cluster_gap_px": args.cluster_gap_px,
+        "mesh_units": mesh_units,
+        "point_units": "cm",
     }
     xrf_rpt = out_dir / f"{art}_xrf_report.json"
     with open(xrf_rpt, "w") as f:
