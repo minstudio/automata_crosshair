@@ -837,6 +837,26 @@ def mesh_texture_colors(mesh):
         return None
 
 
+NORMAL_RADIUS_CM = 0.35
+
+
+def surface_normal(mesh, point, radius, toward=None):
+    """Unit surface normal at `point`: area-weighted mean of the face normals whose
+    centres lie within `radius` (same units as the mesh), so it reflects the whole
+    measurement spot rather than one noisy triangle. Flipped to point toward
+    `toward` (e.g. the HSI viewing direction) so it faces out of the scanned side."""
+    centers = mesh.triangles_center
+    d = np.linalg.norm(centers - np.asarray(point, dtype=float), axis=1)
+    sel = d <= radius
+    if sel.sum() < 3:
+        sel = d <= np.partition(d, min(8, len(d) - 1))[min(8, len(d) - 1)]
+    n = (mesh.face_normals[sel] * mesh.area_faces[sel, None]).sum(axis=0)
+    n /= np.linalg.norm(n) + 1e-20
+    if toward is not None and float(np.dot(n, toward)) < 0:
+        n = -n
+    return n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--artifact",      default="lot1n1")
@@ -1016,9 +1036,9 @@ def process_artifact(art, args):
     cam_pose = look_at_pose(best_eye)
     print(f"    IoU={best_iou:.3f}  eye={best_eye.round(3)}")
 
+    view_dir = best_eye / (np.linalg.norm(best_eye) + 1e-20)
     rim_tree = None
     if not args.no_rim:
-        view_dir = best_eye / (np.linalg.norm(best_eye) + 1e-20)
         F = mesh_cm.faces
         n_v = len(mesh_cm.vertices)
         I = np.hstack([F[:, 0], F[:, 1], F[:, 1], F[:, 2], F[:, 2], F[:, 0]])
@@ -1302,6 +1322,9 @@ def process_artifact(art, args):
                 "n_faces": entry.get("n_faces"),
                 "targets": [{"label": t.get("label", "?"),
                              "point": [round(float(v), 4) for v in t["point"]],
+                             "normal": [round(float(v), 5) for v in surface_normal(
+                                 mesh_cm, t["point"], NORMAL_RADIUS_CM, view_dir)],
+                             "vertex_idx": int(t["idx"]),
                              "n_px": t.get("n_px"),
                              "pixel": t.get("pixel"),
                              "flatness_score": t.get("flatness_score"),
@@ -1331,6 +1354,9 @@ def process_artifact(art, args):
         "silhouette_iou": round(float(best_iou), 4),
         "targets": [{"label": x.get("label", "?"),
                      "point": [round(float(v), 4) for v in x["point"]],
+                     "normal": [round(float(v), 5) for v in surface_normal(
+                         mesh_cm, x["point"], NORMAL_RADIUS_CM, view_dir)],
+                     "vertex_idx": int(x["idx"]),
                      "half_size": round(float(x["half_size"]), 4),
                      "h": round(float(x["h"]), 6),
                      "rim_d": (round(float(x["rim_d"]), 4)
@@ -1341,6 +1367,7 @@ def process_artifact(art, args):
         "cluster_gap_px": args.cluster_gap_px,
         "mesh_units": mesh_units,
         "point_units": "cm",
+        "normal_note": "unit outward surface normal in the mesh frame, area-weighted over faces within 0.35 cm of the point",
     }
     xrf_rpt = out_dir / f"{art}_xrf_report.json"
     with open(xrf_rpt, "w") as f:

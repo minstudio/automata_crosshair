@@ -118,6 +118,8 @@ Output per artifact in `photogrammetry/output/hsi_clusters/`:
 <artifact>_hsi_clusters_regions.ply   # cluster regions painted on the mesh
 ```
 
+Both JSON reports give each target as `point` (cm, in the source mesh's frame), `normal` (unit outward surface normal in the same frame, area-weighted over faces within 0.35 cm, oriented toward the HSI viewpoint) and `vertex_idx` (index of the mesh vertex at the target).
+
 Open the PLYs in MeshLab / CloudCompare to inspect the targets.
 
 `photogrammetry/analyze_hsi_clusters_remote.py` is the previous remote version, kept for reference only.
