@@ -1,17 +1,24 @@
 """
-ROI-crop BiRefNet segmentation for HSI viewfinder images.
+BiRefNet segmentation of the artifact in HSI viewfinder/reflectance images.
 
-Draw a bounding box around the artifact; the crop is fed to BiRefNet so the
-model sees the object up close. The resulting mask is placed back into full-
-image coordinates and saved.
+Default (automatic, no user input):
+    1. BiRefNet on the full image.
+    2. Keep the largest foreground component that does not touch the image
+       border (the platform ring / fixtures do), fill holes.
+    3. Crop around it with padding and run BiRefNet again on the crop, so the
+       model sees the object up close; keep the component overlapping the
+       first-pass mask.
+
+--manual: the old interactive mode, where you draw the ROI box yourself
+(needed for cluttered scenes).
 
 Usage — single image:
     python hsi/segment_roi_birefnet.py --viewfinder path/to/viewfinder.png --output path/to/mask.png
 
 Usage — batch over all artifact folders that have HSI:
-    python hsi/segment_roi_birefnet.py --batch --output_dir hsi/output
+    python hsi/segment_roi_birefnet.py --batch --hsi_only --output_dir hsi/output/roi
 
-Controls (per image):
+Manual mode controls (per image):
     Left-drag   draw / redraw the ROI rectangle
     Enter/R     run BiRefNet on current ROI
     S           save mask and move to next image
@@ -66,6 +73,118 @@ def run_birefnet_on_crop(bgr_crop):
         preds = torch.nn.functional.interpolate(
             preds, size=(h, w), mode="bilinear", align_corners=False)
     return preds.squeeze().cpu().numpy()   # float32 [0,1]
+
+
+# ── Automatic segmentation ──────────────────────────────────────────────────────
+
+def _components(mask_u8):
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    return n, labels, stats
+
+
+def _fill_holes(mask_u8):
+    h, w = mask_u8.shape
+    flood = mask_u8.copy()
+    ff = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(flood, ff, (0, 0), 255)
+    return mask_u8 | cv2.bitwise_not(flood)
+
+
+def _pick_object(prob, threshold=0.5, border=2, min_frac=0.003):
+    """Pick the artifact from a foreground probability map.
+
+    The largest component that does not touch the image border wins (the
+    platform ring and fixtures do touch it). If the artifact is joined to
+    them by thin bridges, increasingly strong openings are tried to cut the
+    bridges; the chosen piece is then grown back inside the original mask.
+    Falls back to the largest component overall. Returns uint8 0/255 or None."""
+    m = (prob > threshold).astype(np.uint8) * 255
+    if not m.any():
+        return None
+    H, W = m.shape
+    min_area = int(min_frac * H * W)
+    for k in (0, 5, 9, 15):
+        mk = cv2.morphologyEx(m, cv2.MORPH_OPEN,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) if k else m
+        n, labels, stats = _components(mk)
+        best, best_area = None, 0
+        for i in range(1, n):
+            x, y, w, h, area = stats[i]
+            touches = x <= border or y <= border or x + w >= W - border or y + h >= H - border
+            if not touches and area >= min_area and area > best_area:
+                best, best_area = i, area
+        if best is not None:
+            piece = ((labels == best) * 255).astype(np.uint8)
+            if k:
+                grown = cv2.dilate(piece, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k + 2, k + 2)))
+                piece = cv2.bitwise_and(grown, m)
+                n2, l2, s2 = _components(piece)
+                if n2 > 2:
+                    piece = ((l2 == 1 + int(np.argmax(s2[1:, cv2.CC_STAT_AREA]))) * 255).astype(np.uint8)
+                print(f"  separated the artifact from border-touching structures (opening {k}px)")
+            return _fill_holes(piece)
+    n, labels, stats = _components(m)
+    pick = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    print("  [!] no artifact-sized component away from the image border; using the largest")
+    return _fill_holes(((labels == pick) * 255).astype(np.uint8))
+
+
+def auto_segment(bgr, pad_frac=0.25, threshold=0.5):
+    """Automatic two-pass BiRefNet segmentation. Returns (mask uint8 0/255, info) or (None, reason)."""
+    H, W = bgr.shape[:2]
+    prob1 = run_birefnet_on_crop(bgr)
+    m1 = _pick_object(prob1, threshold)
+    if m1 is None:
+        return None, "no foreground found"
+    ys, xs = np.where(m1 > 0)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    py, px = int((y1 - y0) * pad_frac) + 8, int((x1 - x0) * pad_frac) + 8
+    y0, y1 = max(0, y0 - py), min(H, y1 + py)
+    x0, x1 = max(0, x0 - px), min(W, x1 + px)
+    prob2 = np.zeros((H, W), np.float32)
+    prob2[y0:y1, x0:x1] = run_birefnet_on_crop(bgr[y0:y1, x0:x1])
+    m2 = (prob2 > threshold).astype(np.uint8) * 255
+    n, labels, stats = _components(m2)
+    if n > 1:
+        overlap = [int(((labels == i) & (m1 > 0)).sum()) for i in range(1, n)]
+        k = int(np.argmax(overlap)) + 1
+        if overlap[k - 1] > 0:
+            m2 = _fill_holes(((labels == k) * 255).astype(np.uint8))
+        else:
+            m2 = m1
+    else:
+        m2 = m1
+    frac = (m2 > 0).mean()
+    info = f"crop {x1 - x0}x{y1 - y0}, mask {int((m2 > 0).sum())} px ({100 * frac:.1f}%)"
+    if frac < 0.002 or frac > 0.6:
+        info += "  [!] unusual mask size, check the overlay (or rerun with --manual)"
+    return m2, info
+
+
+def save_mask(viewfinder_bgr, mask, name, output_dir):
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mask_path = out_dir / f"{name}_mask.png"
+    cv2.imwrite(str(mask_path), mask)
+    overlay = viewfinder_bgr.copy()
+    fg = mask > 127
+    overlay[fg] = (overlay[fg] * 0.45 + np.array([0, 220, 0]) * 0.55).astype(np.uint8)
+    cts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, cts, -1, (0, 255, 0), 2)
+    cv2.imwrite(str(out_dir / f"{name}_mask_overlay.png"), overlay)
+    print(f"  Saved: {mask_path}")
+    return mask_path
+
+
+def process_one_auto(viewfinder_bgr, name, output_dir):
+    print(f"\n  {name}: automatic segmentation")
+    mask, info = auto_segment(viewfinder_bgr)
+    if mask is None:
+        print(f"  FAILED: {info}")
+        return "skip"
+    print(f"  {info}")
+    save_mask(viewfinder_bgr, mask, name, output_dir)
+    return "save"
 
 
 # ── HSI I/O ───────────────────────────────────────────────────────────────────
@@ -299,21 +418,7 @@ def process_one(viewfinder_bgr, name, output_dir):
     mask, action = seg.run()
 
     if action == "save" and mask is not None:
-        out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        mask_path = out_dir / f"{name}_mask.png"
-        cv2.imwrite(str(mask_path), mask)
-
-        # debug overlay
-        overlay  = viewfinder_bgr.copy()
-        fg       = mask > 127
-        overlay[fg] = (overlay[fg] * 0.45 + np.array([0, 220, 0]) * 0.55).astype(np.uint8)
-        cts, _   = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay, cts, -1, (0, 255, 0), 2)
-        cv2.imwrite(str(out_dir / f"{name}_mask_overlay.png"), overlay)
-
-        print(f"  Saved: {mask_path}")
+        save_mask(viewfinder_bgr, mask, name, output_dir)
 
     return action
 
@@ -341,7 +446,11 @@ def main():
     ap.add_argument("--hsi_only", action="store_true",
                     help="In batch mode, include every artifact that has HSI data "
                          "(default: require all 4 data types: HSI, photogrammetry, pXRF, Raman)")
+    ap.add_argument("--manual", action="store_true",
+                    help="Interactive mode: draw the ROI box yourself (for cluttered scenes). "
+                         "Default: fully automatic")
     args = ap.parse_args()
+    run_one = process_one if args.manual else process_one_auto
 
     if args.viewfinder:
         # ── single image mode ──────────────────────────────────────────────
@@ -350,7 +459,7 @@ def main():
             sys.exit(f"Cannot read: {args.viewfinder}")
         name = Path(args.viewfinder).stem
         out_dir = str(Path(args.output).parent) if args.output else "."
-        action = process_one(img, name, out_dir)
+        action = run_one(img, name, out_dir)
         if action == "save" and args.output:
             # also copy to the exact path requested
             mask_path = Path(out_dir) / f"{name}_mask.png"
@@ -391,7 +500,7 @@ def main():
                 continue
 
             print(f"\n[{i+1}/{len(folders)}]", end="")
-            action = process_one(img, name, str(out_dir))
+            action = run_one(img, name, str(out_dir))
 
             if action == "quit":
                 print("Quitting.")

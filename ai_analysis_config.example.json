@@ -1,0 +1,10 @@
+{
+  "broker": "localhost",
+  "port": 1883,
+  "data_root": "D:/automata_data/current_batch",
+  "overwrite": false,
+  "step_timeout_s": 1800,
+  "segment_args": ["--hsi_only"],
+  "cluster_args": ["--source", "raw"],
+  "points_args": []
+}

@@ -11,3 +11,4 @@ pyrender
 torch
 torchvision
 transformers
+paho-mqtt

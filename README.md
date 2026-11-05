@@ -58,9 +58,11 @@ photogrammetry/output/hsi_clusters/    # step 3: crosshair PLYs
 
 ## Workflow
 
-### Step 1 - Manual ROI selection + BiRefNet segmentation
+### Step 1 - BiRefNet artifact segmentation
 
-Interactive: for each artifact you draw a bounding box around the object in the viewfinder image, BiRefNet segments it inside that box, and the mask is saved in full-image coordinates.
+Automatic by default (no user input): BiRefNet runs on the full image, the largest foreground component not touching the image border is kept (the platform ring and fixtures touch it; thin bridges to them are cut), then BiRefNet runs again on a padded crop around it for a sharper mask. Masks smaller than 0.2% or larger than 60% of the image are flagged in the log: check `<artifact>_mask_overlay.png`.
+
+`--manual` switches to the interactive mode for cluttered scenes: you draw a bounding box around the object, BiRefNet segments inside it, and the mask is saved in full-image coordinates.
 
 Always run batch mode with `--hsi_only`. Without it the script also requires legacy `pXRF/` and `Raman/` subfolders that this pipeline does not use:
 
@@ -70,7 +72,7 @@ python hsi/segment_roi_birefnet.py --batch --hsi_only --output_dir hsi/output/ro
 
 Add `--artifacts lot1n1 lot2n15` to segment only specific artifacts.
 
-Controls per image: left-drag to draw/redraw the ROI box, `Enter`/`R` to run BiRefNet on the current box, `S` to save the mask and move to the next image, `D` to skip without saving, `Q` to quit. Already-masked artifacts are skipped unless `--overwrite` is passed.
+Manual mode controls per image: left-drag to draw/redraw the ROI box, `Enter`/`R` to run BiRefNet on the current box, `S` to save the mask and move to the next image, `D` to skip without saving, `Q` to quit. Already-masked artifacts are skipped unless `--overwrite` is passed.
 
 Single image mode:
 
@@ -136,3 +138,51 @@ Open the PLYs in MeshLab / CloudCompare to inspect the targets.
 - `photogrammetry/analyze_hsi_clusters.py`: crosshair generation entry point (step 3).
 - `photogrammetry/analyze_hsi_clusters_remote.py`: previous remote version (legacy).
 - `gpu.py`: device selection and BiRefNet loading/inference with CPU fallback.
+
+## Running as the AUTOMATA orchestrator subsystem
+
+`ai_analysis_service.py` makes this pipeline the `ai_analysis` subsystem of the
+[AUTOMATA orchestrator](https://github.com/GDqbrobotics/Automata_Project_Orchestrator).
+It talks MQTT only (`pip install paho-mqtt`):
+
+| Topic | Direction | Content |
+|---|---|---|
+| `automata/subsystem/ai_analysis/event` | in | `{"event": "plan", "object_id": "object_003"}`, plus `stop`, `reset`, `error`, `pause`, `resume` |
+| `automata/subsystem/ai_analysis/status` | out | `{"state", "ready", "paused", "name"}` on every change and every 2 s |
+| `automata/subsystem/ai_analysis/response` | out | `{"type": "object_points", "object_id", "points": [...]}` |
+
+States: `initializing → ready → analyzing → ready`; `stop` → `stopped`; failures → `error` (`reset` → `ready`).
+
+On `plan` it processes `<data_root>/<object_id>/` (same layout as above: `HSI/raw_data/...`,
+`photogrammetry/processed_data/textured_mesh.glb`), runs steps 1-3 with outputs in
+`<data_root>/<object_id>/HSI/processed_data/{roi,roi_clustered,crosshair}/`, then publishes
+**all** targets before reporting `ready`:
+
+```json
+{"label": "xrf", "coordinates": [x, y, z, roll, pitch, yaw], "rank": 1, "normal": [nx, ny, nz]}
+```
+
+- Position in **metres**, in the mesh frame (robot `base_link` for the 3DI meshes).
+- Orientation in radians, fixed-axis XYZ: `R = Rz(yaw) · Ry(pitch) · Rx(roll)`. The pose's Z axis
+  points **into** the surface (approach direction = −normal); its X axis is the mesh X axis
+  projected on the surface plane.
+- Order: XRF by rank, then Raman by cluster and rank (`label: "raman"`, plus `cluster` and
+  `shared_with_xrf`). The orchestrator forwards only `coordinates`, filtered by label.
+- A copy is written to `crosshair/<object_id>_ai_points.json`.
+
+Steps whose output already exists are skipped unless `--overwrite` / `"overwrite": true`.
+
+```bash
+cp ai_analysis_config.example.json ai_analysis_config.json   # set broker + data_root
+python ai_analysis_service.py --config ai_analysis_config.json
+```
+
+Config keys: `broker`, `port`, `data_root`, `python` (interpreter for the steps), `overwrite`,
+`step_timeout_s`, `segment_args` / `cluster_args` / `points_args` (extra CLI flags per step;
+default clustering is `--source raw`), and `fields` to rename MQTT payload fields if
+`mqtt_formats.yaml` changes on the orchestrator side.
+
+To test with the orchestrator's simulators: start it with `--simulation`, toggle `ai_analysis`
+to real hardware in the GUI (or send `{"command": "toggle_subsystem_simulation", "subsystem": "ai_analysis"}`
+on its WebSocket), start this service, then press Start. The object ids from the simulated
+vision system (`object_001`, ...) must exist as folders under `data_root`.

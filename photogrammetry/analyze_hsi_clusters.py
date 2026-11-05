@@ -862,6 +862,8 @@ def main():
     ap.add_argument("--artifact",      default="lot1n1")
     ap.add_argument("--dataset",       default=str(DATASET_ROOT),
                     help="Dataset root (one folder per artifact)")
+    ap.add_argument("--roi-dir",       default=None,
+                    help="Directory with *_mask.png (default: hsi/output/roi)")
     ap.add_argument("--clusters-dir",  default=None,
                     help="Directory with *_clusters.png")
     ap.add_argument("--output",        default=None)
@@ -948,7 +950,7 @@ def process_artifact(art, args):
 
     clusters_dir = Path(args.clusters_dir) if args.clusters_dir \
         else script_dir / "hsi" / "output" / "roi_clustered"
-    roi_dir  = script_dir / "hsi" / "output" / "roi"
+    roi_dir  = Path(args.roi_dir) if args.roi_dir else script_dir / "hsi" / "output" / "roi"
     out_dir  = Path(args.output) if args.output \
         else script_dir / "photogrammetry" / "output" / "hsi_clusters"
     out_dir.mkdir(parents=True, exist_ok=True)
